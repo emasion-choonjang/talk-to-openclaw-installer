@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import glob
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 from typing import Tuple
@@ -28,11 +30,43 @@ def plist_path() -> pathlib.Path:
     return pathlib.Path.home() / "Library" / "LaunchAgents" / PLIST_NAME
 
 
-def write_plist(py_bin: str, bridge_script: str, port: int, public_host: str, tts_engine: str) -> pathlib.Path:
+def detect_openclaw_bin() -> str:
+    found = shutil.which("openclaw")
+    if found:
+        return found
+    candidates = [
+        "/opt/homebrew/bin/openclaw",
+        "/usr/local/bin/openclaw",
+        os.path.expanduser("~/bin/openclaw"),
+    ]
+    candidates.extend(
+        sorted(glob.glob(os.path.expanduser("~/.nvm/versions/node/*/bin/openclaw")), reverse=True)
+    )
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return "openclaw"
+
+
+def write_plist(
+    py_bin: str,
+    bridge_script: str,
+    port: int,
+    public_host: str,
+    tts_engine: str,
+    installer_bootstrap_url: str,
+) -> pathlib.Path:
     p = plist_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     out_log = "/tmp/sori_bridge.out.log"
     err_log = "/tmp/sori_bridge.err.log"
+    installer_env = (
+        f"\n      <key>INSTALLER_BOOTSTRAP_URL</key><string>{installer_bootstrap_url}</string>"
+        if installer_bootstrap_url
+        else ""
+    )
+    default_path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    openclaw_bin = detect_openclaw_bin()
     content = f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -54,6 +88,9 @@ def write_plist(py_bin: str, bridge_script: str, port: int, public_host: str, tt
       <key>OPENCLAW_PORT</key><string>{port}</string>
       <key>OPENCLAW_PUBLIC_HOST</key><string>{public_host}</string>
       <key>TTS_ENGINE</key><string>{tts_engine}</string>
+      <key>PATH</key><string>{default_path}</string>
+      <key>OPENCLAW_BIN</key><string>{openclaw_bin}</string>
+{installer_env}
     </dict>
   </dict>
 </plist>
@@ -123,7 +160,14 @@ def uninstall() -> dict:
 def cmd_install(args: argparse.Namespace) -> int:
     bridge_script = str(repo_root() / "scripts" / "dev" / "run_mock_openclaw_server.py")
     py_bin = args.python or default_python()
-    plist = write_plist(py_bin, bridge_script, args.bridge_port, args.public_host, args.tts_engine)
+    plist = write_plist(
+        py_bin,
+        bridge_script,
+        args.bridge_port,
+        args.public_host,
+        args.tts_engine,
+        args.installer_bootstrap_url,
+    )
     boot = bootstrap(plist)
     if not boot.get("ok"):
         print(json.dumps({"ok": False, "step": "bootstrap", "error": boot.get("error")}, ensure_ascii=False))
@@ -132,7 +176,14 @@ def cmd_install(args: argparse.Namespace) -> int:
     if not kick.get("ok"):
         print(json.dumps({"ok": False, "step": "kickstart", "error": kick.get("error")}, ensure_ascii=False))
         return 1
-    payload = {"ok": True, "label": LABEL, "plist": str(plist), "bridge_port": args.bridge_port, "pairing_code": args.pairing_code}
+    payload = {
+        "ok": True,
+        "label": LABEL,
+        "plist": str(plist),
+        "bridge_port": args.bridge_port,
+        "pairing_code": args.pairing_code,
+        "installer_bootstrap_url": args.installer_bootstrap_url,
+    }
     print(json.dumps(payload, ensure_ascii=False))
     return 0
 
@@ -146,6 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--bridge-port", type=int, default=18890)
     pi.add_argument("--public-host", default="127.0.0.1")
     pi.add_argument("--tts-engine", default="edge")
+    pi.add_argument("--installer-bootstrap-url", default="")
     pi.add_argument("--python", default="")
 
     sub.add_parser("status")
