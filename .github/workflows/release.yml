@@ -1,0 +1,25 @@
+name: release-installer
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build SHA256SUMS
+        run: |
+          mkdir -p checksums
+          sha256sum installer/sori_agent.py installer/install.sh > checksums/SHA256SUMS
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            installer/sori_agent.py
+            installer/install.sh
+            checksums/SHA256SUMS
