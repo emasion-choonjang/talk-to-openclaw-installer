@@ -19,6 +19,7 @@ BUILTIN_REQUIREMENTS = [
     "faster-whisper>=1.0.3",
 ]
 DEFAULT_OPENCLAW_AGENT = "sori-bridge"
+DEFAULT_OPENCLAW_MODEL = "anthropic/claude-haiku-4-5"
 DEFAULT_BRIDGE_SCRIPT_URL = (
     "https://raw.githubusercontent.com/emasion-choonjang/talk-to-openclaw-installer/main/"
     "installer/run_mock_openclaw_server.py"
@@ -400,7 +401,7 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--public-host", default="127.0.0.1")
     pi.add_argument("--tts-engine", default="edge")
     pi.add_argument("--openclaw-agent", default=DEFAULT_OPENCLAW_AGENT)
-    pi.add_argument("--openclaw-model", default="")
+    pi.add_argument("--openclaw-model", default=DEFAULT_OPENCLAW_MODEL)
     pi.add_argument(
         "--openclaw-workspace",
         default=str(pathlib.Path.home() / ".local" / "share" / "sori-bridge" / "openclaw-workspace"),
