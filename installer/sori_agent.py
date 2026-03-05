@@ -231,8 +231,13 @@ def write_plist(
 def bootstrap(plist: pathlib.Path) -> dict:
     uid = str(os.getuid())
     run(["launchctl", "bootout", f"gui/{uid}", LABEL])
+    run(["launchctl", "bootout", f"gui/{uid}/{LABEL}"])
     code, out, err = run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)])
     if code != 0:
+        # If already loaded (or transient launchctl state), treat as recoverable
+        chk_code, chk_out, chk_err = run(["launchctl", "print", f"gui/{uid}/{LABEL}"])
+        if chk_code == 0 and "state = running" in chk_out:
+            return {"ok": True, "warning": err or out}
         return {"ok": False, "error": err or out}
     return {"ok": True}
 
