@@ -7,7 +7,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
-from typing import Tuple
+from typing import Any, Tuple
 
 LABEL = "ai.sori.bridge"
 PLIST_NAME = f"{LABEL}.plist"
@@ -17,6 +17,7 @@ BUILTIN_REQUIREMENTS = [
     "edge-tts>=6.1.12",
     "faster-whisper>=1.0.3",
 ]
+DEFAULT_OPENCLAW_AGENT = "sori-bridge"
 
 
 def run(cmd: list[str]) -> Tuple[int, str, str]:
@@ -79,6 +80,60 @@ def verify_bridge_runtime(venv_python: str) -> Tuple[bool, str]:
     return True, "ok"
 
 
+def ensure_openclaw_agent_config(
+    openclaw_bin: str,
+    agent_name: str,
+    model_name: str,
+    workspace_dir: pathlib.Path,
+) -> Tuple[bool, dict[str, Any]]:
+    if not shutil.which(openclaw_bin) and not os.path.isfile(openclaw_bin):
+        return False, {"error": f"openclaw_not_found: {openclaw_bin}"}
+
+    code, out, err = run([openclaw_bin, "agents", "list", "--json"])
+    if code != 0:
+        return False, {"error": f"agents_list_failed: {err or out}"}
+    try:
+        rows = json.loads(out or "[]")
+    except Exception as exc:
+        return False, {"error": f"agents_list_parse_failed: {exc}"}
+
+    exists = any(str(r.get("id", "")).strip() == agent_name for r in rows if isinstance(r, dict))
+    if not exists:
+        cmd = [
+            openclaw_bin,
+            "agents",
+            "add",
+            agent_name,
+            "--non-interactive",
+            "--workspace",
+            str(workspace_dir),
+        ]
+        if model_name:
+            cmd.extend(["--model", model_name])
+        code, out, err = run(cmd)
+        if code != 0:
+            return False, {"error": f"agents_add_failed: {err or out}"}
+
+    model_set = "skipped"
+    model_set_error = None
+    if model_name:
+        code, out, err = run([openclaw_bin, "models", "--agent", agent_name, "set", model_name])
+        if code == 0:
+            model_set = "ok"
+        else:
+            model_set = "failed"
+            model_set_error = err or out or "models_set_failed"
+
+    return True, {
+        "agent": agent_name,
+        "agent_created": not exists,
+        "workspace": str(workspace_dir),
+        "model": model_name or None,
+        "model_set": model_set,
+        "model_set_error": model_set_error,
+    }
+
+
 def detect_openclaw_bin() -> str:
     found = shutil.which("openclaw")
     if found:
@@ -104,6 +159,8 @@ def write_plist(
     port: int,
     public_host: str,
     tts_engine: str,
+    openclaw_agent: str,
+    openclaw_thinking: str,
     installer_bootstrap_url: str,
 ) -> pathlib.Path:
     p = plist_path()
@@ -140,8 +197,11 @@ def write_plist(
       <key>OPENCLAW_PORT</key><string>{port}</string>
       <key>OPENCLAW_PUBLIC_HOST</key><string>{public_host}</string>
       <key>TTS_ENGINE</key><string>{tts_engine}</string>
-      <key>OPENCLAW_DIALOG_TIMEOUT_SEC</key><string>12</string>
-      <key>ASR_TURN_WAIT_SEC</key><string>18</string>
+      <key>OPENCLAW_DEFAULT_AGENT</key><string>{openclaw_agent}</string>
+      <key>OPENCLAW_THINKING_LEVEL</key><string>{openclaw_thinking}</string>
+      <key>OPENCLAW_DIALOG_TIMEOUT_SEC</key><string>20</string>
+      <key>ASR_TURN_WAIT_SEC</key><string>80</string>
+      <key>STT_TIMEOUT_SEC</key><string>35</string>
       <key>PATH</key><string>{merged_path}</string>
       <key>OPENCLAW_BIN</key><string>{openclaw_bin}</string>
 {installer_env}
@@ -244,8 +304,24 @@ def cmd_install(args: argparse.Namespace) -> int:
         args.bridge_port,
         args.public_host,
         args.tts_engine,
+        args.openclaw_agent,
+        args.openclaw_thinking,
         args.installer_bootstrap_url,
     )
+
+    openclaw_bin = detect_openclaw_bin()
+    openclaw_workspace = pathlib.Path(args.openclaw_workspace).expanduser()
+    openclaw_workspace.mkdir(parents=True, exist_ok=True)
+    ok, oc = ensure_openclaw_agent_config(
+        openclaw_bin=openclaw_bin,
+        agent_name=args.openclaw_agent,
+        model_name=args.openclaw_model,
+        workspace_dir=openclaw_workspace,
+    )
+    if not ok:
+        print(json.dumps({"ok": False, "step": "openclaw_agent_setup", **oc}, ensure_ascii=False))
+        return 1
+
     boot = bootstrap(plist)
     if not boot.get("ok"):
         print(json.dumps({"ok": False, "step": "bootstrap", "error": boot.get("error")}, ensure_ascii=False))
@@ -263,6 +339,11 @@ def cmd_install(args: argparse.Namespace) -> int:
         "installer_bootstrap_url": args.installer_bootstrap_url,
         "venv_python": py_bin,
         "requirements": str(pathlib.Path(args.requirements).expanduser()),
+        "openclaw_agent": args.openclaw_agent,
+        "openclaw_model": args.openclaw_model or None,
+        "openclaw_thinking": args.openclaw_thinking,
+        "openclaw_bin": openclaw_bin,
+        "openclaw_agent_setup": oc,
     }
     print(json.dumps(payload, ensure_ascii=False))
     return 0
@@ -277,6 +358,13 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--bridge-port", type=int, default=18890)
     pi.add_argument("--public-host", default="127.0.0.1")
     pi.add_argument("--tts-engine", default="edge")
+    pi.add_argument("--openclaw-agent", default=DEFAULT_OPENCLAW_AGENT)
+    pi.add_argument("--openclaw-model", default="")
+    pi.add_argument(
+        "--openclaw-workspace",
+        default=str(pathlib.Path.home() / ".local" / "share" / "sori-bridge" / "openclaw-workspace"),
+    )
+    pi.add_argument("--openclaw-thinking", default="minimal")
     pi.add_argument("--installer-bootstrap-url", default="")
     pi.add_argument("--python", default="")
     pi.add_argument("--venv-dir", default=str(DEFAULT_VENV_DIR))
