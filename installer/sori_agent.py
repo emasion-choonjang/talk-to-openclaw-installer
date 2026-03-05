@@ -7,6 +7,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import urllib.request
 from typing import Any, Tuple
 
 LABEL = "ai.sori.bridge"
@@ -18,15 +19,15 @@ BUILTIN_REQUIREMENTS = [
     "faster-whisper>=1.0.3",
 ]
 DEFAULT_OPENCLAW_AGENT = "sori-bridge"
+DEFAULT_BRIDGE_SCRIPT_URL = (
+    "https://raw.githubusercontent.com/emasion-choonjang/talk-to-openclaw/main/"
+    "scripts/dev/run_mock_openclaw_server.py"
+)
 
 
 def run(cmd: list[str]) -> Tuple[int, str, str]:
     cp = subprocess.run(cmd, capture_output=True, text=True)
     return cp.returncode, cp.stdout.strip(), cp.stderr.strip()
-
-
-def repo_root() -> pathlib.Path:
-    return pathlib.Path(__file__).resolve().parents[2]
 
 
 def default_python() -> str:
@@ -78,6 +79,20 @@ def verify_bridge_runtime(venv_python: str) -> Tuple[bool, str]:
     if code != 0:
         return False, f"faster_whisper_missing: {err or out}"
     return True, "ok"
+
+
+def ensure_bridge_script(script_url: str, install_dir: pathlib.Path) -> Tuple[bool, str]:
+    install_dir.mkdir(parents=True, exist_ok=True)
+    bridge_script = install_dir / "run_mock_openclaw_server.py"
+    try:
+        with urllib.request.urlopen(script_url, timeout=30) as resp:
+            body = resp.read()
+    except Exception as exc:
+        return False, f"bridge_script_download_failed: {exc}"
+    if not body:
+        return False, "bridge_script_download_failed: empty_body"
+    bridge_script.write_bytes(body)
+    return True, str(bridge_script)
 
 
 def ensure_openclaw_agent_config(
@@ -272,11 +287,12 @@ def uninstall() -> dict:
 
 
 def cmd_install(args: argparse.Namespace) -> int:
-    root = repo_root()
-    bridge_script = str(root / "scripts" / "dev" / "run_mock_openclaw_server.py")
-    if not pathlib.Path(bridge_script).exists():
-        print(json.dumps({"ok": False, "step": "precheck", "error": "bridge_script_not_found"}, ensure_ascii=False))
+    install_home = pathlib.Path(args.install_home).expanduser()
+    ok, payload = ensure_bridge_script(args.bridge_script_url, install_home)
+    if not ok:
+        print(json.dumps({"ok": False, "step": "precheck", "error": payload}, ensure_ascii=False))
         return 1
+    bridge_script = payload
 
     base_python = args.python or default_python()
     venv_dir = pathlib.Path(args.venv_dir).expanduser()
@@ -300,7 +316,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     plist = write_plist(
         py_bin,
         bridge_script,
-        str(root),
+        str(install_home),
         args.bridge_port,
         args.public_host,
         args.tts_engine,
@@ -344,6 +360,9 @@ def cmd_install(args: argparse.Namespace) -> int:
         "openclaw_thinking": args.openclaw_thinking,
         "openclaw_bin": openclaw_bin,
         "openclaw_agent_setup": oc,
+        "bridge_script_url": args.bridge_script_url,
+        "bridge_script_path": bridge_script,
+        "install_home": str(install_home),
     }
     print(json.dumps(payload, ensure_ascii=False))
     return 0
@@ -369,6 +388,8 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--python", default="")
     pi.add_argument("--venv-dir", default=str(DEFAULT_VENV_DIR))
     pi.add_argument("--requirements", default=str(DEFAULT_REQUIREMENTS))
+    pi.add_argument("--bridge-script-url", default=DEFAULT_BRIDGE_SCRIPT_URL)
+    pi.add_argument("--install-home", default=str(pathlib.Path.home() / ".local" / "share" / "sori-bridge" / "bridge"))
     pi.add_argument("--skip-deps", action="store_true")
 
     sub.add_parser("status")
