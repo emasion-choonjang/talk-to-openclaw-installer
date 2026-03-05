@@ -15,11 +15,12 @@ jobs:
       - name: Build SHA256SUMS
         run: |
           mkdir -p checksums
-          sha256sum installer/sori_agent.py installer/install.sh > checksums/SHA256SUMS
+          sha256sum installer/sori_agent.py installer/install.sh installer/run_mock_openclaw_server.py > checksums/SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             installer/sori_agent.py
             installer/install.sh
+            installer/run_mock_openclaw_server.py
             checksums/SHA256SUMS

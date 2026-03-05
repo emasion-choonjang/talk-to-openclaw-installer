@@ -20,8 +20,8 @@ BUILTIN_REQUIREMENTS = [
 ]
 DEFAULT_OPENCLAW_AGENT = "sori-bridge"
 DEFAULT_BRIDGE_SCRIPT_URL = (
-    "https://raw.githubusercontent.com/emasion-choonjang/talk-to-openclaw/main/"
-    "scripts/dev/run_mock_openclaw_server.py"
+    "https://raw.githubusercontent.com/emasion-choonjang/talk-to-openclaw-installer/main/"
+    "installer/run_mock_openclaw_server.py"
 )
 
 
