@@ -4,7 +4,7 @@
 `INSTALLER_BOOTSTRAP_URL`을 GitHub Release의 태그 고정 URL로 설정한다.
 
 예시:
-`https://github.com/<org>/talk-to-openclaw-installer/releases/download/v1.0.3/sori_agent.py`
+`https://github.com/<org>/talk-to-openclaw-installer/releases/download/v1.0.4/sori_agent.py`
 
 ## 2) 설치 실행
 ```bash

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BOOTSTRAP_URL_DEFAULT="https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v1.0.3/sori_agent.py"
+BOOTSTRAP_URL_DEFAULT="https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v1.0.4/sori_agent.py"
 BOOTSTRAP_URL="${INSTALLER_BOOTSTRAP_URL:-$BOOTSTRAP_URL_DEFAULT}"
 PAIRING_CODE="${PAIRING_CODE:-}"
 BRIDGE_PORT="${BRIDGE_PORT:-18890}"
