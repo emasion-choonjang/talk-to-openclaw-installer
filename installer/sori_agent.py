@@ -11,6 +11,12 @@ from typing import Tuple
 
 LABEL = "ai.sori.bridge"
 PLIST_NAME = f"{LABEL}.plist"
+DEFAULT_VENV_DIR = pathlib.Path.home() / ".local" / "share" / "sori-bridge" / "venv"
+DEFAULT_REQUIREMENTS = pathlib.Path(__file__).resolve().with_name("bridge_requirements.txt")
+BUILTIN_REQUIREMENTS = [
+    "edge-tts>=6.1.12",
+    "faster-whisper>=1.0.3",
+]
 
 
 def run(cmd: list[str]) -> Tuple[int, str, str]:
@@ -28,6 +34,49 @@ def default_python() -> str:
 
 def plist_path() -> pathlib.Path:
     return pathlib.Path.home() / "Library" / "LaunchAgents" / PLIST_NAME
+
+
+def venv_python_path(venv_dir: pathlib.Path) -> pathlib.Path:
+    return venv_dir / "bin" / "python"
+
+
+def ensure_venv_python(base_python: str, venv_dir: pathlib.Path) -> Tuple[bool, str]:
+    py = venv_python_path(venv_dir)
+    if py.exists():
+        return True, str(py)
+
+    venv_dir.parent.mkdir(parents=True, exist_ok=True)
+    code, out, err = run([base_python, "-m", "venv", str(venv_dir)])
+    if code != 0:
+        return False, err or out or "venv_create_failed"
+    if not py.exists():
+        return False, "venv_python_not_found"
+    return True, str(py)
+
+
+def install_bridge_dependencies(venv_python: str, requirements_path: pathlib.Path) -> Tuple[bool, str]:
+    code, out, err = run([venv_python, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+    if code != 0:
+        return False, f"pip_bootstrap_failed: {err or out}"
+
+    if requirements_path.exists():
+        install_cmd = [venv_python, "-m", "pip", "install", "-r", str(requirements_path)]
+    else:
+        install_cmd = [venv_python, "-m", "pip", "install", *BUILTIN_REQUIREMENTS]
+    code, out, err = run(install_cmd)
+    if code != 0:
+        return False, f"pip_install_failed: {err or out}"
+    return True, "ok"
+
+
+def verify_bridge_runtime(venv_python: str) -> Tuple[bool, str]:
+    code, out, err = run([venv_python, "-m", "edge_tts", "--help"])
+    if code != 0:
+        return False, f"edge_tts_missing: {err or out}"
+    code, out, err = run([venv_python, "-c", "import faster_whisper; print('ok')"])
+    if code != 0:
+        return False, f"faster_whisper_missing: {err or out}"
+    return True, "ok"
 
 
 def detect_openclaw_bin() -> str:
@@ -51,6 +100,7 @@ def detect_openclaw_bin() -> str:
 def write_plist(
     py_bin: str,
     bridge_script: str,
+    work_dir: str,
     port: int,
     public_host: str,
     tts_engine: str,
@@ -66,6 +116,8 @@ def write_plist(
         else ""
     )
     default_path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    py_dir = str(pathlib.Path(py_bin).resolve().parent)
+    merged_path = f"{py_dir}:{default_path}"
     openclaw_bin = detect_openclaw_bin()
     content = f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -77,7 +129,7 @@ def write_plist(
       <string>{py_bin}</string>
       <string>{bridge_script}</string>
     </array>
-    <key>WorkingDirectory</key><string>{repo_root()}</string>
+    <key>WorkingDirectory</key><string>{work_dir}</string>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>StandardOutPath</key><string>{out_log}</string>
@@ -88,7 +140,9 @@ def write_plist(
       <key>OPENCLAW_PORT</key><string>{port}</string>
       <key>OPENCLAW_PUBLIC_HOST</key><string>{public_host}</string>
       <key>TTS_ENGINE</key><string>{tts_engine}</string>
-      <key>PATH</key><string>{default_path}</string>
+      <key>OPENCLAW_DIALOG_TIMEOUT_SEC</key><string>12</string>
+      <key>ASR_TURN_WAIT_SEC</key><string>18</string>
+      <key>PATH</key><string>{merged_path}</string>
       <key>OPENCLAW_BIN</key><string>{openclaw_bin}</string>
 {installer_env}
     </dict>
@@ -158,11 +212,35 @@ def uninstall() -> dict:
 
 
 def cmd_install(args: argparse.Namespace) -> int:
-    bridge_script = str(repo_root() / "scripts" / "dev" / "run_mock_openclaw_server.py")
-    py_bin = args.python or default_python()
+    root = repo_root()
+    bridge_script = str(root / "scripts" / "dev" / "run_mock_openclaw_server.py")
+    if not pathlib.Path(bridge_script).exists():
+        print(json.dumps({"ok": False, "step": "precheck", "error": "bridge_script_not_found"}, ensure_ascii=False))
+        return 1
+
+    base_python = args.python or default_python()
+    venv_dir = pathlib.Path(args.venv_dir).expanduser()
+    ok, payload = ensure_venv_python(base_python, venv_dir)
+    if not ok:
+        print(json.dumps({"ok": False, "step": "venv", "error": payload}, ensure_ascii=False))
+        return 1
+    py_bin = payload
+
+    if not args.skip_deps:
+        req_path = pathlib.Path(args.requirements).expanduser()
+        ok, payload = install_bridge_dependencies(py_bin, req_path)
+        if not ok:
+            print(json.dumps({"ok": False, "step": "deps_install", "error": payload}, ensure_ascii=False))
+            return 1
+        ok, payload = verify_bridge_runtime(py_bin)
+        if not ok:
+            print(json.dumps({"ok": False, "step": "deps_verify", "error": payload}, ensure_ascii=False))
+            return 1
+
     plist = write_plist(
         py_bin,
         bridge_script,
+        str(root),
         args.bridge_port,
         args.public_host,
         args.tts_engine,
@@ -183,6 +261,8 @@ def cmd_install(args: argparse.Namespace) -> int:
         "bridge_port": args.bridge_port,
         "pairing_code": args.pairing_code,
         "installer_bootstrap_url": args.installer_bootstrap_url,
+        "venv_python": py_bin,
+        "requirements": str(pathlib.Path(args.requirements).expanduser()),
     }
     print(json.dumps(payload, ensure_ascii=False))
     return 0
@@ -199,6 +279,9 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--tts-engine", default="edge")
     pi.add_argument("--installer-bootstrap-url", default="")
     pi.add_argument("--python", default="")
+    pi.add_argument("--venv-dir", default=str(DEFAULT_VENV_DIR))
+    pi.add_argument("--requirements", default=str(DEFAULT_REQUIREMENTS))
+    pi.add_argument("--skip-deps", action="store_true")
 
     sub.add_parser("status")
     sub.add_parser("start")
