@@ -7,6 +7,7 @@ from urllib.request import Request, urlopen
 from collections import deque
 from io import BytesIO
 from array import array
+import fcntl
 import json
 import ipaddress
 import importlib.util
@@ -143,6 +144,7 @@ JWT_ISSUER = os.environ.get("BRIDGE_JWT_ISSUER", "sori-bridge").strip()
 JWT_AUDIENCE = os.environ.get("BRIDGE_JWT_AUDIENCE", "sori-mobile").strip()
 JWT_DEFAULT_TTL_SEC = int(os.environ.get("BRIDGE_JWT_TTL_SEC", "3600"))
 AUTH_REQUIRED_V2 = os.environ.get("BRIDGE_AUTH_REQUIRED_V2", "1").strip().lower() in ("1", "true", "yes", "on")
+INSTANCE_LOCK_HANDLE = None
 
 
 def save_dialog_route_state() -> None:
@@ -585,6 +587,22 @@ def generate_tone_wav(sample_rate: int = 16000, freq_hz: int = 660, duration_sec
         wf.writeframes(bytes(frames))
     return bio.getvalue()
 
+
+
+
+def acquire_instance_lock(port: int):
+    lock_path = f"/tmp/sori-bridge-{port}.lock"
+    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise RuntimeError(f"bridge_already_running_on_port_{port}")
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
 
 def synthesize_text_wav(text: str) -> bytes:
     text = sanitize_tts_text(text)
@@ -2601,14 +2619,24 @@ async function submitPair(){{
 
 
 if __name__ == "__main__":
+    try:
+        INSTANCE_LOCK_HANDLE = acquire_instance_lock(PORT)
+    except RuntimeError as exc:
+        print(f"[bridge] {exc}", flush=True)
+        raise SystemExit(0)
     load_dialog_route_state()
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
     threading.Thread(target=bridge_log_writer, daemon=True, name="bridge-log-writer").start()
     threading.Thread(target=turn_job_worker, daemon=True, name="turn-job-worker").start()
     print(
         f"[tts] config engine={TTS_ENGINE} voice={VOICE} xtts_speaker={XTTS_SPEAKER_WAV or '-'}",
         flush=True,
     )
-    warmup_stt_runtime()
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"OpenClaw mock server listening on http://{HOST}:{PORT} public_host={PUBLIC_HOST}")
-    server.serve_forever()
+    threading.Thread(target=warmup_stt_runtime, daemon=True, name="stt-warmup").start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("[bridge] shutdown requested", flush=True)
+    finally:
+        server.server_close()

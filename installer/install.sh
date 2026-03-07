@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${VERSION:-1.0.12}"
+VERSION="${VERSION:-1.0.16}"
 PAIRING_CODE="${PAIRING_CODE:-}"
 BRIDGE_PORT="${BRIDGE_PORT:-18890}"
 PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
@@ -33,6 +33,86 @@ require_cmd() {
   }
 }
 
+detect_openclaw_bin() {
+  if command -v openclaw >/dev/null 2>&1; then
+    command -v openclaw
+    return
+  fi
+  local candidate
+  for candidate in \
+    "/opt/homebrew/bin/openclaw" \
+    "/usr/local/bin/openclaw" \
+    "$HOME/bin/openclaw"; do
+    if [[ -x "$candidate" ]]; then
+      echo "$candidate"
+      return
+    fi
+  done
+  while IFS= read -r candidate; do
+    if [[ -x "$candidate" ]]; then
+      echo "$candidate"
+      return
+    fi
+  done < <(find "$HOME/.nvm/versions/node" -type f -path '*/bin/openclaw' 2>/dev/null | sort -r)
+  echo "openclaw"
+}
+
+detect_node_bin() {
+  local openclaw_bin="${1:-}"
+  if command -v node >/dev/null 2>&1; then
+    command -v node
+    return
+  fi
+  local candidate
+  if [[ -n "$openclaw_bin" && "$openclaw_bin" != "openclaw" ]]; then
+    candidate="$(dirname "$openclaw_bin")/node"
+    if [[ -x "$candidate" ]]; then
+      echo "$candidate"
+      return
+    fi
+  fi
+  for candidate in \
+    "/opt/homebrew/bin/node" \
+    "/usr/local/bin/node" \
+    "$HOME/bin/node"; do
+    if [[ -x "$candidate" ]]; then
+      echo "$candidate"
+      return
+    fi
+  done
+  while IFS= read -r candidate; do
+    if [[ -x "$candidate" ]]; then
+      echo "$candidate"
+      return
+    fi
+  done < <(find "$HOME/.nvm/versions/node" -type f -path '*/bin/node' 2>/dev/null | sort -r)
+  echo "node"
+}
+
+append_path_segment() {
+  local dir="${1:-}"
+  [[ -n "$dir" ]] || return 0
+  case ":${LAUNCH_PATH}:" in
+    *":${dir}:"*) ;;
+    *) LAUNCH_PATH="${LAUNCH_PATH:+${LAUNCH_PATH}:}${dir}" ;;
+  esac
+}
+
+build_launch_path() {
+  local openclaw_bin="${1:-}"
+  local node_bin="${2:-}"
+  LAUNCH_PATH=""
+  append_path_segment "$(dirname "$openclaw_bin")"
+  append_path_segment "$(dirname "$node_bin")"
+  append_path_segment "/opt/homebrew/bin"
+  append_path_segment "/usr/local/bin"
+  append_path_segment "/usr/bin"
+  append_path_segment "/bin"
+  append_path_segment "/usr/sbin"
+  append_path_segment "/sbin"
+  echo "$LAUNCH_PATH"
+}
+
 prune_old_releases() {
   [[ -d "$RELEASES_DIR" ]] || return 0
   local keep_dir
@@ -52,6 +132,11 @@ remove_legacy_runtime() {
 }
 
 write_plist() {
+  local openclaw_bin node_bin launch_path
+  openclaw_bin="$(detect_openclaw_bin)"
+  node_bin="$(detect_node_bin "$openclaw_bin")"
+  launch_path="$(build_launch_path "$openclaw_bin" "$node_bin")"
+
   mkdir -p "$(dirname "$PLIST_PATH")"
   cat > "$PLIST_PATH" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -76,10 +161,36 @@ write_plist() {
       <key>TTS_ENGINE</key><string>${TTS_ENGINE}</string>
       <key>OPENCLAW_DEFAULT_AGENT</key><string>${OPENCLAW_AGENT}</string>
       <key>OPENCLAW_THINKING_LEVEL</key><string>${OPENCLAW_THINKING}</string>
+      <key>OPENCLAW_BIN</key><string>${openclaw_bin}</string>
+      <key>PATH</key><string>${launch_path}</string>
     </dict>
   </dict>
 </plist>
 PLIST
+}
+
+restart_launch_agent() {
+  local uid_num bootstrap_log print_log
+  uid_num="$(id -u)"
+  bootstrap_log="$TMP_DIR/bootstrap.log"
+  print_log="$TMP_DIR/launchctl-print.log"
+
+  launchctl bootout "gui/${uid_num}" ai.sori.bridge >/dev/null 2>&1 || true
+  launchctl bootout "gui/${uid_num}/ai.sori.bridge" >/dev/null 2>&1 || true
+
+  if ! launchctl bootstrap "gui/${uid_num}" "$PLIST_PATH" >"$bootstrap_log" 2>&1; then
+    if launchctl print "gui/${uid_num}/ai.sori.bridge" >"$print_log" 2>&1 && grep -q "state = running" "$print_log"; then
+      log "launchctl bootstrap reported transient failure but service is running"
+    else
+      cat "$bootstrap_log" >&2
+      return 1
+    fi
+  fi
+
+  if ! launchctl kickstart -k "gui/${uid_num}/ai.sori.bridge" >>"$bootstrap_log" 2>&1; then
+    cat "$bootstrap_log" >&2
+    return 1
+  fi
 }
 
 install_binary() {
@@ -114,11 +225,7 @@ install_binary() {
   ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
 
   write_plist
-
-  UID_NUM="$(id -u)"
-  launchctl bootout "gui/${UID_NUM}" ai.sori.bridge >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/${UID_NUM}" "$PLIST_PATH"
-  launchctl kickstart -k "gui/${UID_NUM}/ai.sori.bridge"
+  restart_launch_agent
 
   prune_old_releases
   remove_legacy_runtime

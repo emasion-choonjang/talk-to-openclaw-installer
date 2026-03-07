@@ -19,6 +19,13 @@ class InstallScriptContractTests(unittest.TestCase):
         self.assertIn("remove_legacy_runtime", body)
         self.assertIn(".local/share/sori-bridge", body)
 
+    def test_install_script_exports_openclaw_runtime_path(self):
+        body = (ROOT / "installer" / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("detect_openclaw_bin", body)
+        self.assertIn("detect_node_bin", body)
+        self.assertIn("OPENCLAW_BIN</key>", body)
+        self.assertIn("PATH</key>", body)
+
 
 if __name__ == "__main__":
     unittest.main()
