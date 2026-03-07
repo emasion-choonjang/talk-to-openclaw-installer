@@ -91,7 +91,7 @@ ASR_TURN_WAIT_SEC = int(os.environ.get("ASR_TURN_WAIT_SEC", "80"))
 ASR_ONLY_MODE = os.environ.get("ASR_ONLY_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
 INSTALLER_BOOTSTRAP_URL = os.environ.get(
     "INSTALLER_BOOTSTRAP_URL",
-    "https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v1.0.10/sori_agent.py",
+    "https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v1.0.12/sori_agent.py",
 ).strip()
 CLOVA_API_BASE = os.environ.get("CLOVA_API_BASE", "https://naveropenapi.apigw.ntruss.com/tts-premium/v1").strip()
 CLOVA_API_KEY_ID = os.environ.get("CLOVA_API_KEY_ID", "").strip()
