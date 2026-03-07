@@ -14,9 +14,11 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 LEGACY_BOOTSTRAP_URL="${INSTALLER_BOOTSTRAP_URL:-https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v${VERSION}/sori_agent.py}"
 
 INSTALL_ROOT="${HOME}/Library/Application Support/SORI/bridge"
-RELEASE_DIR="${INSTALL_ROOT}/releases/${VERSION}"
+RELEASES_DIR="${INSTALL_ROOT}/releases"
+RELEASE_DIR="${RELEASES_DIR}/${VERSION}"
 CURRENT_LINK="${INSTALL_ROOT}/current"
 PLIST_PATH="${HOME}/Library/LaunchAgents/ai.sori.bridge.plist"
+LEGACY_ROOT="${HOME}/.local/share/sori-bridge"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -29,6 +31,24 @@ require_cmd() {
     echo "[installer] ERROR: required command not found: $1" >&2
     exit 1
   }
+}
+
+prune_old_releases() {
+  [[ -d "$RELEASES_DIR" ]] || return 0
+  local keep_dir
+  keep_dir="$(cd "$RELEASE_DIR" && pwd -P)"
+  find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d | while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    local candidate_dir
+    candidate_dir="$(cd "$candidate" && pwd -P)"
+    if [[ "$candidate_dir" != "$keep_dir" ]]; then
+      rm -rf "$candidate"
+    fi
+  done
+}
+
+remove_legacy_runtime() {
+  rm -rf "$LEGACY_ROOT/bridge" "$LEGACY_ROOT/venv"
 }
 
 write_plist() {
@@ -73,6 +93,7 @@ install_binary() {
     exit 1
   fi
 
+  rm -rf "$RELEASE_DIR"
   mkdir -p "$RELEASE_DIR"
   ARCHIVE_PATH="$TMP_DIR/sori-bridge-macos-arm64.tar.gz"
 
@@ -99,6 +120,8 @@ install_binary() {
   launchctl bootstrap "gui/${UID_NUM}" "$PLIST_PATH"
   launchctl kickstart -k "gui/${UID_NUM}/ai.sori.bridge"
 
+  prune_old_releases
+  remove_legacy_runtime
   log "binary install done"
 }
 

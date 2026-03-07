@@ -43,7 +43,7 @@ jobs:
       - name: Build SHA256SUMS
         run: |
           mkdir -p release/checksums
-          sha256sum installer/install.sh release/sori-bridge-macos-arm64.tar.gz release/stable.json > release/checksums/SHA256SUMS
+          shasum -a 256 installer/install.sh release/sori-bridge-macos-arm64.tar.gz release/stable.json | sed 's#  # #g' > release/checksums/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: bridge-release-artifacts

@@ -138,23 +138,13 @@ def ensure_openclaw_agent_config(
         if code != 0:
             return False, {"error": f"agents_add_failed: {err or out}"}
 
-    model_set = "skipped"
-    model_set_error = None
-    if model_name:
-        code, out, err = run([openclaw_bin, "models", "--agent", agent_name, "set", model_name], timeout_sec=60)
-        if code == 0:
-            model_set = "ok"
-        else:
-            model_set = "failed"
-            model_set_error = err or out or "models_set_failed"
-
     return True, {
         "agent": agent_name,
         "agent_created": not exists,
         "workspace": str(workspace_dir),
         "model": model_name or None,
-        "model_set": model_set,
-        "model_set_error": model_set_error,
+        "model_set": "skipped_for_isolation",
+        "model_set_error": None,
     }
 
 

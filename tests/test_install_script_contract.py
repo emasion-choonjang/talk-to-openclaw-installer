@@ -12,6 +12,13 @@ class InstallScriptContractTests(unittest.TestCase):
         self.assertIn("CURRENT_LINK", body)
         self.assertIn("launchctl bootstrap", body)
 
+    def test_install_script_prunes_old_bridge_releases(self):
+        body = (ROOT / "installer" / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("prune_old_releases", body)
+        self.assertIn("RELEASES_DIR", body)
+        self.assertIn("remove_legacy_runtime", body)
+        self.assertIn(".local/share/sori-bridge", body)
+
 
 if __name__ == "__main__":
     unittest.main()
