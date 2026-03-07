@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 from urllib.parse import urlencode

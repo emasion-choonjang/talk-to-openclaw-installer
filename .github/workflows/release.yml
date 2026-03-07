@@ -6,6 +6,49 @@ on:
       - 'v*'
 
 jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install build deps
+        run: |
+          python3 -m pip install --upgrade pip setuptools wheel
+          python3 -m pip install pyinstaller -r installer/bridge_requirements.txt
+      - name: Build bridge binary
+        run: |
+          pyinstaller installer/pyinstaller/bridge.spec --distpath dist --workpath build
+          mkdir -p release
+          cp dist/sori-bridge release/sori-bridge
+          chmod +x release/sori-bridge
+          tar -czf release/sori-bridge-macos-arm64.tar.gz -C release sori-bridge
+          shasum -a 256 release/sori-bridge-macos-arm64.tar.gz | awk '{print $1}' > release/sori-bridge-macos-arm64.sha256
+      - name: Render stable manifest
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          SHA="$(cat release/sori-bridge-macos-arm64.sha256)"
+          python3 - <<PY
+          import json
+          from pathlib import Path
+          p = Path('stable.json')
+          payload = json.loads(p.read_text())
+          payload['version'] = '${VERSION}'
+          payload['asset_url'] = 'https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v${VERSION}/sori-bridge-macos-arm64.tar.gz'
+          payload['sha256'] = '${SHA}'
+          payload['install_script_url'] = 'https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v${VERSION}/install.sh'
+          Path('release/stable.json').write_text(json.dumps(payload, indent=2) + '\n')
+          PY
+      - name: Build SHA256SUMS
+        run: |
+          mkdir -p release/checksums
+          sha256sum installer/install.sh release/sori-bridge-macos-arm64.tar.gz release/stable.json > release/checksums/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge-release-artifacts
+          path: release/
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -16,20 +59,21 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [build, test]
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Build SHA256SUMS
-        run: |
-          mkdir -p checksums
-          sha256sum installer/sori_agent.py installer/install.sh installer/run_mock_openclaw_server.py > checksums/SHA256SUMS
+      - uses: actions/download-artifact@v4
+        with:
+          name: bridge-release-artifacts
+          path: release
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            installer/sori_agent.py
             installer/install.sh
-            installer/run_mock_openclaw_server.py
-            checksums/SHA256SUMS
+            release/sori-bridge-macos-arm64.tar.gz
+            release/sori-bridge-macos-arm64.sha256
+            release/stable.json
+            release/checksums/SHA256SUMS

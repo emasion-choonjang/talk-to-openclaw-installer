@@ -14,3 +14,13 @@ jobs:
       - name: Run installer tests
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -p 'test_*.py'
+      - name: Validate stable manifest
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          payload = json.loads(Path('stable.json').read_text())
+          assert payload['channel'] == 'stable'
+          assert payload['asset_url']
+          assert payload['install_script_url']
+          PY
