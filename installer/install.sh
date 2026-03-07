@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${VERSION:-1.0.16}"
+VERSION="${VERSION:-1.0.17}"
 PAIRING_CODE="${PAIRING_CODE:-}"
 BRIDGE_PORT="${BRIDGE_PORT:-18890}"
 PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
@@ -170,19 +170,26 @@ PLIST
 }
 
 restart_launch_agent() {
-  local uid_num bootstrap_log print_log
+  local uid_num bootstrap_log print_log enable_log bootstrap_output
   uid_num="$(id -u)"
   bootstrap_log="$TMP_DIR/bootstrap.log"
   print_log="$TMP_DIR/launchctl-print.log"
+  enable_log="$TMP_DIR/launchctl-enable.log"
 
   launchctl bootout "gui/${uid_num}" ai.sori.bridge >/dev/null 2>&1 || true
   launchctl bootout "gui/${uid_num}/ai.sori.bridge" >/dev/null 2>&1 || true
+  launchctl enable "gui/${uid_num}/ai.sori.bridge" >"$enable_log" 2>&1 || true
 
   if ! launchctl bootstrap "gui/${uid_num}" "$PLIST_PATH" >"$bootstrap_log" 2>&1; then
     if launchctl print "gui/${uid_num}/ai.sori.bridge" >"$print_log" 2>&1 && grep -q "state = running" "$print_log"; then
       log "launchctl bootstrap reported transient failure but service is running"
     else
-      cat "$bootstrap_log" >&2
+      bootstrap_output="$(cat "$bootstrap_log" 2>/dev/null || true)"
+      if printf '%s' "$bootstrap_output" | grep -qi 'try re-running the command as root'; then
+        echo "[installer] ERROR: launchctl bootstrap failed in user domain (root not required). GUI user session/disabled service/state issue." >&2
+      fi
+      printf '%s
+' "$bootstrap_output" >&2
       return 1
     fi
   fi
