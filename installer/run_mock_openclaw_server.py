@@ -11,6 +11,9 @@ import ipaddress
 import importlib.util
 import math
 import glob
+import base64
+import hashlib
+import hmac
 import os
 import re
 import secrets
@@ -62,7 +65,7 @@ OPENCLAW_DEFAULT_SESSION_ID = os.environ.get(
 ).strip()
 OPENCLAW_DIALOG_TIMEOUT_SEC = int(os.environ.get("OPENCLAW_DIALOG_TIMEOUT_SEC", "20"))
 OPENCLAW_DEFAULT_AGENT = os.environ.get("OPENCLAW_DEFAULT_AGENT", "sori-bridge").strip() or "sori-bridge"
-OPENCLAW_BOOTSTRAP_MODEL = os.environ.get("OPENCLAW_BOOTSTRAP_MODEL", "").strip()
+OPENCLAW_BOOTSTRAP_MODEL = os.environ.get("OPENCLAW_BOOTSTRAP_MODEL", "anthropic/claude-haiku-4-5").strip()
 OPENCLAW_THINKING_LEVEL = os.environ.get("OPENCLAW_THINKING_LEVEL", "minimal").strip().lower()
 OPENCLAW_BIN_RAW = os.environ.get("OPENCLAW_BIN", "openclaw").strip() or "openclaw"
 OPENCLAW_NO_EMOJI = os.environ.get("OPENCLAW_NO_EMOJI", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -88,7 +91,7 @@ ASR_TURN_WAIT_SEC = int(os.environ.get("ASR_TURN_WAIT_SEC", "80"))
 ASR_ONLY_MODE = os.environ.get("ASR_ONLY_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
 INSTALLER_BOOTSTRAP_URL = os.environ.get(
     "INSTALLER_BOOTSTRAP_URL",
-    "https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v1.0.6/sori_agent.py",
+    "https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v1.0.10/sori_agent.py",
 ).strip()
 CLOVA_API_BASE = os.environ.get("CLOVA_API_BASE", "https://naveropenapi.apigw.ntruss.com/tts-premium/v1").strip()
 CLOVA_API_KEY_ID = os.environ.get("CLOVA_API_KEY_ID", "").strip()
@@ -129,9 +132,16 @@ ASR_EVENTS = deque(maxlen=80)
 ASR_EVENTS_LOCK = threading.Lock()
 TURN_EVENTS = deque(maxlen=300)
 TURN_EVENTS_LOCK = threading.Lock()
+EVENT_SEQ = 0
+EVENT_SEQ_LOCK = threading.Lock()
 LOG_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=2000)
 TURN_JOB_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=32)
 BRIDGE_LOG_PATH = os.environ.get("BRIDGE_LOG_PATH", "data/logs/bridge/events.jsonl").strip()
+BRIDGE_AUTH_SECRET = os.environ.get("BRIDGE_AUTH_SECRET", "dev-bridge-secret").strip()
+JWT_ISSUER = os.environ.get("BRIDGE_JWT_ISSUER", "sori-bridge").strip()
+JWT_AUDIENCE = os.environ.get("BRIDGE_JWT_AUDIENCE", "sori-mobile").strip()
+JWT_DEFAULT_TTL_SEC = int(os.environ.get("BRIDGE_JWT_TTL_SEC", "3600"))
+AUTH_REQUIRED_V2 = os.environ.get("BRIDGE_AUTH_REQUIRED_V2", "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 def save_dialog_route_state() -> None:
@@ -199,16 +209,109 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def b64url_decode(data: str) -> bytes:
+    padding = "=" * ((4 - len(data) % 4) % 4)
+    return base64.urlsafe_b64decode((data + padding).encode("ascii"))
+
+
+def jwt_sign_hs256(claims: dict) -> str:
+    if not BRIDGE_AUTH_SECRET:
+        raise RuntimeError("bridge auth secret is not configured")
+    header = {"alg": "HS256", "typ": "JWT"}
+    h = b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    p = b64url_encode(json.dumps(claims, separators=(",", ":")).encode("utf-8"))
+    msg = f"{h}.{p}".encode("ascii")
+    sig = hmac.new(BRIDGE_AUTH_SECRET.encode("utf-8"), msg, hashlib.sha256).digest()
+    return f"{h}.{p}.{b64url_encode(sig)}"
+
+
+def jwt_verify_hs256(token: str) -> dict:
+    if not BRIDGE_AUTH_SECRET:
+        raise RuntimeError("bridge auth secret is not configured")
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise RuntimeError("invalid_jwt_format")
+    h, p, s = parts
+    msg = f"{h}.{p}".encode("ascii")
+    expected = hmac.new(BRIDGE_AUTH_SECRET.encode("utf-8"), msg, hashlib.sha256).digest()
+    got = b64url_decode(s)
+    if not hmac.compare_digest(expected, got):
+        raise RuntimeError("invalid_jwt_signature")
+    payload = json.loads(b64url_decode(p).decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("invalid_jwt_payload")
+    now = int(time.time())
+    exp = int(payload.get("exp", 0))
+    if exp and now >= exp:
+        raise RuntimeError("jwt_expired")
+    if payload.get("iss") != JWT_ISSUER:
+        raise RuntimeError("invalid_jwt_issuer")
+    if JWT_AUDIENCE and payload.get("aud") != JWT_AUDIENCE:
+        raise RuntimeError("invalid_jwt_audience")
+    return payload
+
+
+def issue_access_token(pairing_code: str, subject: str, ttl_sec: int) -> tuple[str, int]:
+    ttl = max(300, min(7200, int(ttl_sec or JWT_DEFAULT_TTL_SEC)))
+    now = int(time.time())
+    claims = {
+        "iss": JWT_ISSUER,
+        "aud": JWT_AUDIENCE,
+        "sub": subject,
+        "pc": pairing_code,
+        "iat": now,
+        "exp": now + ttl,
+        "scope": "chat events",
+    }
+    return jwt_sign_hs256(claims), ttl
+
+
+def next_event_seq() -> int:
+    global EVENT_SEQ
+    with EVENT_SEQ_LOCK:
+        EVENT_SEQ += 1
+        return EVENT_SEQ
+
+
+def enrich_event(stream: str, event: dict) -> dict:
+    out = dict(event or {})
+    out.setdefault("stream", stream)
+    out.setdefault("source", "bridge")
+    out.setdefault("source_ts_ms", now_ms())
+    out.setdefault("event_seq", next_event_seq())
+    return out
+
+
 def push_asr_event(event: dict) -> None:
+    payload = enrich_event("asr", event)
     with ASR_EVENTS_LOCK:
-        ASR_EVENTS.append(event)
-    enqueue_bridge_log("asr_event", event)
+        ASR_EVENTS.append(payload)
+    enqueue_bridge_log("asr_event", payload)
 
 
 def push_turn_event(event: dict) -> None:
+    payload = enrich_event("turn", event)
     with TURN_EVENTS_LOCK:
-        TURN_EVENTS.append(event)
-    enqueue_bridge_log("turn_event", event)
+        TURN_EVENTS.append(payload)
+    enqueue_bridge_log("turn_event", payload)
+
+
+def collect_v2_events(since_seq: int = 0, limit: int = 200) -> list[dict]:
+    with ASR_EVENTS_LOCK:
+        asr = list(ASR_EVENTS)
+    with TURN_EVENTS_LOCK:
+        turn = list(TURN_EVENTS)
+    merged = asr + turn
+    merged.sort(key=lambda x: int(x.get("event_seq", 0)))
+    if since_seq > 0:
+        merged = [e for e in merged if int(e.get("event_seq", 0)) > since_seq]
+    if limit > 0 and len(merged) > limit:
+        merged = merged[-limit:]
+    return merged
 
 
 def enqueue_bridge_log(kind: str, payload: dict) -> None:
@@ -1170,9 +1273,24 @@ def execute_dialog_turn(
         save_dialog_route_state()
         print(f"[dialog:route] fallback agent={agent_name}", flush=True)
 
-    started_at = time.time()
     turn_id = secrets.token_hex(6)
+    started_at = time.time()
     route_desc = f"to={target or '-'} session={session or '-'} agent={agent_name or '-'}"
+    push_turn_event(
+        {
+            "turn_id": turn_id,
+            "event": "speaker.voice_user_committed",
+            "status": "ok",
+            "text": asr_text,
+            "meta": {
+                "route": {
+                    "to": target or "",
+                    "session_id": session or "",
+                    "agent": agent_name or "",
+                }
+            },
+        }
+    )
     print(
         f"[dialog:start] turn_id={turn_id} asr_len={len(asr_text)} route=({route_desc}) skip_openclaw={int(skip_openclaw)}",
         flush=True,
@@ -1196,6 +1314,25 @@ def execute_dialog_turn(
         )
     t1 = time.time()
     item = enqueue_tts(reply_text)
+    push_turn_event(
+        {
+            "turn_id": turn_id,
+            "event": "speaker.assistant_replied",
+            "status": "ok",
+            "text": reply_text,
+            "id": item.get("id"),
+            "meta": {"created_at_ms": item.get("created_at_ms"), "queue_size": len(QUEUE)},
+        }
+    )
+    push_turn_event(
+        {
+            "turn_id": turn_id,
+            "event": "speaker.tts_enqueued",
+            "status": "ok",
+            "id": item.get("id"),
+            "meta": {"queue_size": len(QUEUE), "path": item.get("path"), "created_at_ms": item.get("created_at_ms")},
+        }
+    )
     tts_ms = int((time.time() - t1) * 1000)
     total_ms = int((time.time() - started_at) * 1000)
     LAST_DIALOG_METRICS = {
@@ -1432,6 +1569,33 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8"))
 
+    def _read_bearer_token(self) -> str:
+        auth = str(self.headers.get("Authorization", "")).strip()
+        if not auth.lower().startswith("bearer "):
+            return ""
+        return auth[7:].strip()
+
+    def _require_v2_auth(self) -> dict | None:
+        if not AUTH_REQUIRED_V2:
+            return {}
+        token = self._read_bearer_token()
+        if not token:
+            self._send_json(401, {"error": "unauthorized", "detail": "missing_bearer_token"})
+            return None
+        try:
+            claims = jwt_verify_hs256(token)
+            pairing_code = str(claims.get("pc") or "").strip().upper()
+            if pairing_code:
+                with PAIRING_LOCK:
+                    session = PAIRING_SESSIONS.get(pairing_code)
+                if not session or session.get("status") != "confirmed":
+                    self._send_json(401, {"error": "unauthorized", "detail": "pairing_not_confirmed"})
+                    return None
+            return claims
+        except Exception as exc:
+            self._send_json(401, {"error": "unauthorized", "detail": str(exc)})
+            return None
+
     def do_GET(self):
         global CURRENT_DIALOG_TARGET, CURRENT_DIALOG_SESSION_ID, CURRENT_DIALOG_AGENT, LAST_TTS_PULL_AT_MS, LAST_TTS_PULL_IP, LAST_TTS_PULL_METRICS
         parsed = urlparse(self.path)
@@ -1459,9 +1623,10 @@ class Handler(BaseHTTPRequestHandler):
                 last_install = dict(LAST_INSTALL_RESULT)
             dynamic_bridge_endpoint = request_bridge_endpoint(self)
             now = now_ms()
+            # Pull interval can stretch when device is busy (mic turn/upload), so keep this window relaxed.
             speaker_recent = bool(
                 LAST_TTS_PULL_AT_MS
-                and (now - LAST_TTS_PULL_AT_MS) <= 15000
+                and (now - LAST_TTS_PULL_AT_MS) <= 120000
                 and not is_localhost_ip(LAST_TTS_PULL_IP)
             )
             self._send_json(
@@ -1493,6 +1658,12 @@ class Handler(BaseHTTPRequestHandler):
                     "asr": {
                         "only_mode": ASR_ONLY_MODE,
                     },
+                    "capabilities": {
+                        "v2_events_stream": True,
+                        "v2_events_poll": True,
+                        "v2_chat_turn": True,
+                        "v2_auth_required": AUTH_REQUIRED_V2,
+                    },
                 },
             )
             return
@@ -1507,6 +1678,97 @@ class Handler(BaseHTTPRequestHandler):
             with TURN_EVENTS_LOCK:
                 events = list(TURN_EVENTS)
             self._send_json(200, {"ok": True, "count": len(events), "events": events})
+            return
+
+        if path == "/v2/events":
+            claims = self._require_v2_auth()
+            if claims is None:
+                return
+            try:
+                since_seq = int(str(qs.get("since_seq", ["0"])[0]).strip() or "0")
+            except Exception:
+                since_seq = 0
+            try:
+                limit = int(str(qs.get("limit", ["200"])[0]).strip() or "200")
+            except Exception:
+                limit = 200
+            if limit < 1:
+                limit = 1
+            if limit > 1000:
+                limit = 1000
+            events = collect_v2_events(since_seq=since_seq, limit=limit)
+            last_seq = events[-1].get("event_seq", since_seq) if events else since_seq
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "since_seq": since_seq,
+                    "last_seq": last_seq,
+                    "count": len(events),
+                    "events": events,
+                },
+            )
+            return
+
+        if path == "/v2/events/stream":
+            claims = self._require_v2_auth()
+            if claims is None:
+                return
+            try:
+                since_seq = int(str(qs.get("since_seq", ["0"])[0]).strip() or "0")
+            except Exception:
+                since_seq = 0
+            last_event_id = str(self.headers.get("Last-Event-ID", "")).strip()
+            if last_event_id.isdigit():
+                since_seq = max(since_seq, int(last_event_id))
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            def send_sse(evt: str, data: dict, event_id: int | None = None):
+                payload = json.dumps(data, ensure_ascii=False)
+                lines = []
+                if event_id is not None:
+                    lines.append(f"id: {event_id}\n")
+                lines.append(f"event: {evt}\n")
+                for ln in payload.splitlines():
+                    lines.append(f"data: {ln}\n")
+                lines.append("\n")
+                self.wfile.write("".join(lines).encode("utf-8"))
+                self.wfile.flush()
+
+            started_ms = now_ms()
+            stream_timeout_ms = 55000
+            heartbeat_every_ms = 5000
+            next_hb_ms = started_ms + heartbeat_every_ms
+            cursor = since_seq
+
+            try:
+                bootstrap = collect_v2_events(since_seq=cursor, limit=300)
+                for item in bootstrap:
+                    eid = int(item.get("event_seq", 0))
+                    send_sse("event", item, eid)
+                    cursor = max(cursor, eid)
+
+                while (now_ms() - started_ms) < stream_timeout_ms:
+                    updates = collect_v2_events(since_seq=cursor, limit=300)
+                    if updates:
+                        for item in updates:
+                            eid = int(item.get("event_seq", 0))
+                            send_sse("event", item, eid)
+                            cursor = max(cursor, eid)
+                    nowv = now_ms()
+                    if nowv >= next_hb_ms:
+                        send_sse("heartbeat", {"ts_ms": nowv, "last_seq": cursor}, None)
+                        next_hb_ms = nowv + heartbeat_every_ms
+                    time.sleep(0.5)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception:
+                return
             return
 
         if path == "/asr/dashboard":
@@ -1833,15 +2095,11 @@ tick();
 <body>
 <div class="card">
 <h2>SORI 페어링</h2>
-<p>앱의 6자리 코드를 입력하고 연결을 확정하세요. OpenClaw 대상 정보는 선택입니다.</p>
+<p>앱의 6자리 코드를 입력하고 연결을 확정하세요.</p>
 <p class="hint">네트워크 안내: ESP32는 2.4GHz만 지원합니다. 맥/폰도 같은 로컬망(가능하면 동일 2.4GHz)으로 맞춰주세요.</p>
 <label>Pairing Code</label><input id="code" placeholder="ABC123" maxlength="6" inputmode="latin" autocapitalize="characters" pattern="[A-Z0-9]{{6}}" />
-<label>OpenClaw To (선택)</label><input id="to" placeholder="+8210..." />
-<label>OpenClaw Session ID (선택)</label><input id="sid" placeholder="session-id" />
-<label>OpenClaw Agent (선택)</label><input id="agent" placeholder="agent-name" />
 <button id="submitBtn" onclick="submitPair()">연결 확정</button>
 <div id="status" class="status"></div>
-<div class="hint">연결 성공 후 앱이 자동으로 다음 단계로 이동합니다.</div>
 </div>
 <script>
 const codeEl = document.getElementById('code');
@@ -1855,6 +2113,25 @@ function setStatus(type, text){{
   statusEl.className = 'status ' + type;
   statusEl.textContent = text;
 }}
+async function bestEffortCompleteDevicePairing(){{
+  try {{
+    const d = await fetch('/discover/device');
+    if (!d.ok) return false;
+    const dj = await d.json();
+    const base = (dj && dj.device_api_base_url) ? String(dj.device_api_base_url).replace(/\/$/, '') : '';
+    if (!base) return false;
+    const r = await fetch(base + '/device/pairing-complete', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ source: 'pairing_portal' }}),
+    }});
+    if (!r.ok) return false;
+    const j = await r.json();
+    return Boolean(j && j.ok);
+  }} catch (e) {{
+    return false;
+  }}
+}}
 async function submitPair(){{
   const code = codeEl.value.trim().toUpperCase();
   if (!/^[A-Z0-9]{{6}}$/.test(code)) {{
@@ -1865,9 +2142,7 @@ async function submitPair(){{
   setStatus('ok', '연결 요청 중...');
   const q=new URLSearchParams({{
     pairingCode:code,
-    to:document.getElementById('to').value.trim(),
-    session_id:document.getElementById('sid').value.trim(),
-    agent:document.getElementById('agent').value.trim(),
+    agent:'{OPENCLAW_DEFAULT_AGENT}',
   }});
   try {{
     const r=await fetch('/pairing/activate?'+q.toString());
@@ -1877,11 +2152,18 @@ async function submitPair(){{
       submitBtn.disabled = false;
       return;
     }}
-    const target = j.dialog?.target || j.dialog?.session_id || j.dialog?.agent;
+    setStatus('ok', '연결 요청 완료. 기기 적용/검증 중...');
+    const paired = await bestEffortCompleteDevicePairing();
+    await new Promise((resolve) => setTimeout(resolve, paired ? 500 : 1200));
+    const s = await fetch('/pairing/session-status?pairingCode=' + encodeURIComponent(code));
+    const sj = await s.json();
+    const target = sj?.dialog?.target || sj?.dialog?.session_id || sj?.dialog?.agent;
     if (target) {{
-      setStatus('ok', '연결 완료. OpenClaw 대상까지 설정되었습니다.');
+      setStatus('ok', paired
+        ? '연결 확정됨. 성공음이 재생되며, 앱이 곧 다음 단계로 이동합니다.'
+        : '연결 확정됨. 앱에서 연결 확인 시 자동으로 다음 단계로 이동합니다.');
     }} else {{
-      setStatus('ok', '연결 완료. OpenClaw 대상은 나중에 앱에서 설정할 수 있습니다.');
+      setStatus('ok', '연결은 확정됐지만 OpenClaw 대상은 아직 없습니다. 앱 안내에 따라 target을 설정하세요.');
     }}
     submitBtn.classList.add('success');
     submitBtn.textContent = '연결 확정됨';
@@ -1981,6 +2263,35 @@ async function submitPair(){{
                 payload = self._read_json()
                 ASR_ONLY_MODE = bool(payload.get("asr_only", False))
                 self._send_json(200, {"ok": True, "asr_only_mode": ASR_ONLY_MODE})
+                return
+            except Exception as exc:
+                self._send_json(400, {"error": "bad_request", "detail": str(exc)})
+                return
+
+        if parsed.path == "/v2/auth/token":
+            try:
+                payload = self._read_json()
+                code = str(payload.get("pairingCode", "")).strip().upper()
+                subject = str(payload.get("deviceId", "")).strip() or str(payload.get("hostId", "")).strip()
+                ttl_sec = int(payload.get("ttlSec", JWT_DEFAULT_TTL_SEC))
+                if not code or not subject:
+                    self._send_json(400, {"error": "bad_request", "detail": "pairingCode/deviceId required"})
+                    return
+                with PAIRING_LOCK:
+                    session = PAIRING_SESSIONS.get(code)
+                if not session or session.get("status") != "confirmed":
+                    self._send_json(401, {"error": "unauthorized", "detail": "pairing_not_confirmed"})
+                    return
+                token, ttl = issue_access_token(code, subject, ttl_sec)
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "token_type": "Bearer",
+                        "access_token": token,
+                        "expires_in": ttl,
+                    },
+                )
                 return
             except Exception as exc:
                 self._send_json(400, {"error": "bad_request", "detail": str(exc)})
@@ -2089,6 +2400,55 @@ async function submitPair(){{
                         "wav_url": f"{request_bridge_endpoint(self)}/tts/item/{item['id']}.wav",
                     },
                 )
+                return
+            except Exception as exc:
+                self._send_json(400, {"error": "bad_request", "detail": str(exc)})
+                return
+
+        if parsed.path == "/tts/clear":
+            try:
+                cleared = len(QUEUE)
+                QUEUE.clear()
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "cleared": cleared,
+                        "wav_store_size": len(WAV_STORE),
+                    },
+                )
+                return
+            except Exception as exc:
+                self._send_json(400, {"error": "bad_request", "detail": str(exc)})
+                return
+
+        if parsed.path == "/v2/chat/turn":
+            claims = self._require_v2_auth()
+            if claims is None:
+                return
+            try:
+                payload = self._read_json()
+                result = execute_dialog_turn(
+                    asr_text=str(payload.get("asr_text", "")).strip(),
+                    skip_openclaw=bool(payload.get("skip_openclaw", False)),
+                    to=str(payload.get("to", "")).strip(),
+                    session_id=str(payload.get("session_id", "")).strip(),
+                    agent=str(payload.get("agent", "")).strip(),
+                    timeout_sec=int(payload.get("timeout_sec", OPENCLAW_DIALOG_TIMEOUT_SEC)),
+                )
+                result["wav_url"] = f"{request_bridge_endpoint(self)}/tts/item/{result['id']}.wav"
+                self._send_json(200, result)
+                return
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or str(exc)).strip()
+                self._send_json(502, {"error": "openclaw_failed", "detail": detail[:400]})
+                return
+            except RuntimeError as exc:
+                detail = str(exc)
+                if detail.startswith("stt_timeout_"):
+                    self._send_json(429, {"error": "busy", "detail": "stt_timeout_retry"})
+                    return
+                self._send_json(400, {"error": "bad_request", "detail": detail})
                 return
             except Exception as exc:
                 self._send_json(400, {"error": "bad_request", "detail": str(exc)})

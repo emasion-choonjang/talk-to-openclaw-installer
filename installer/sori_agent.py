@@ -7,7 +7,6 @@ import pathlib
 import shutil
 import subprocess
 import sys
-import urllib.request
 from typing import Any, Tuple
 
 LABEL = "ai.sori.bridge"
@@ -20,22 +19,15 @@ BUILTIN_REQUIREMENTS = [
 ]
 DEFAULT_OPENCLAW_AGENT = "sori-bridge"
 DEFAULT_OPENCLAW_MODEL = "anthropic/claude-haiku-4-5"
-DEFAULT_BRIDGE_SCRIPT_URL = (
-    "https://raw.githubusercontent.com/emasion-choonjang/talk-to-openclaw-installer/main/"
-    "installer/run_mock_openclaw_server.py"
-)
 
 
-def run(cmd: list[str], timeout_sec: int = 120) -> Tuple[int, str, str]:
-    try:
-        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
-        return cp.returncode, cp.stdout.strip(), cp.stderr.strip()
-    except subprocess.TimeoutExpired:
-        return 124, "", f"command_timeout_{timeout_sec}s: {' '.join(cmd)}"
+def run(cmd: list[str]) -> Tuple[int, str, str]:
+    cp = subprocess.run(cmd, capture_output=True, text=True)
+    return cp.returncode, cp.stdout.strip(), cp.stderr.strip()
 
 
-def info(msg: str) -> None:
-    print(f"[sori-agent] {msg}", flush=True)
+def repo_root() -> pathlib.Path:
+    return pathlib.Path(__file__).resolve().parents[2]
 
 
 def default_python() -> str:
@@ -56,7 +48,7 @@ def ensure_venv_python(base_python: str, venv_dir: pathlib.Path) -> Tuple[bool, 
         return True, str(py)
 
     venv_dir.parent.mkdir(parents=True, exist_ok=True)
-    code, out, err = run([base_python, "-m", "venv", str(venv_dir)], timeout_sec=120)
+    code, out, err = run([base_python, "-m", "venv", str(venv_dir)])
     if code != 0:
         return False, err or out or "venv_create_failed"
     if not py.exists():
@@ -65,7 +57,7 @@ def ensure_venv_python(base_python: str, venv_dir: pathlib.Path) -> Tuple[bool, 
 
 
 def install_bridge_dependencies(venv_python: str, requirements_path: pathlib.Path) -> Tuple[bool, str]:
-    code, out, err = run([venv_python, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"], timeout_sec=300)
+    code, out, err = run([venv_python, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
     if code != 0:
         return False, f"pip_bootstrap_failed: {err or out}"
 
@@ -73,34 +65,20 @@ def install_bridge_dependencies(venv_python: str, requirements_path: pathlib.Pat
         install_cmd = [venv_python, "-m", "pip", "install", "-r", str(requirements_path)]
     else:
         install_cmd = [venv_python, "-m", "pip", "install", *BUILTIN_REQUIREMENTS]
-    code, out, err = run(install_cmd, timeout_sec=1200)
+    code, out, err = run(install_cmd)
     if code != 0:
         return False, f"pip_install_failed: {err or out}"
     return True, "ok"
 
 
 def verify_bridge_runtime(venv_python: str) -> Tuple[bool, str]:
-    code, out, err = run([venv_python, "-m", "edge_tts", "--help"], timeout_sec=60)
+    code, out, err = run([venv_python, "-m", "edge_tts", "--help"])
     if code != 0:
         return False, f"edge_tts_missing: {err or out}"
-    code, out, err = run([venv_python, "-c", "import faster_whisper; print('ok')"], timeout_sec=60)
+    code, out, err = run([venv_python, "-c", "import faster_whisper; print('ok')"])
     if code != 0:
         return False, f"faster_whisper_missing: {err or out}"
     return True, "ok"
-
-
-def ensure_bridge_script(script_url: str, install_dir: pathlib.Path) -> Tuple[bool, str]:
-    install_dir.mkdir(parents=True, exist_ok=True)
-    bridge_script = install_dir / "run_mock_openclaw_server.py"
-    try:
-        with urllib.request.urlopen(script_url, timeout=30) as resp:
-            body = resp.read()
-    except Exception as exc:
-        return False, f"bridge_script_download_failed: {exc}"
-    if not body:
-        return False, "bridge_script_download_failed: empty_body"
-    bridge_script.write_bytes(body)
-    return True, str(bridge_script)
 
 
 def ensure_openclaw_agent_config(
@@ -112,7 +90,7 @@ def ensure_openclaw_agent_config(
     if not shutil.which(openclaw_bin) and not os.path.isfile(openclaw_bin):
         return False, {"error": f"openclaw_not_found: {openclaw_bin}"}
 
-    code, out, err = run([openclaw_bin, "agents", "list", "--json"], timeout_sec=30)
+    code, out, err = run([openclaw_bin, "agents", "list", "--json"])
     if code != 0:
         return False, {"error": f"agents_list_failed: {err or out}"}
     try:
@@ -133,14 +111,14 @@ def ensure_openclaw_agent_config(
         ]
         if model_name:
             cmd.extend(["--model", model_name])
-        code, out, err = run(cmd, timeout_sec=60)
+        code, out, err = run(cmd)
         if code != 0:
             return False, {"error": f"agents_add_failed: {err or out}"}
 
     model_set = "skipped"
     model_set_error = None
     if model_name:
-        code, out, err = run([openclaw_bin, "models", "--agent", agent_name, "set", model_name], timeout_sec=60)
+        code, out, err = run([openclaw_bin, "models", "--agent", agent_name, "set", model_name])
         if code == 0:
             model_set = "ok"
         else:
@@ -238,34 +216,40 @@ def write_plist(
 
 def bootstrap(plist: pathlib.Path) -> dict:
     uid = str(os.getuid())
-    run(["launchctl", "bootout", f"gui/{uid}", LABEL], timeout_sec=20)
-    run(["launchctl", "bootout", f"gui/{uid}/{LABEL}"], timeout_sec=20)
-    code, out, err = run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)], timeout_sec=25)
+    # Prefer service-target form; it is more reliable than domain+label split.
+    run(["launchctl", "bootout", f"gui/{uid}/{LABEL}"])
+    run(["launchctl", "bootout", f"gui/{uid}", LABEL])
+    code, out, err = run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)])
     if code != 0:
-        # If already loaded (or transient launchctl state), treat as recoverable
-        chk_code, chk_out, chk_err = run(["launchctl", "print", f"gui/{uid}/{LABEL}"], timeout_sec=20)
-        if chk_code == 0 and "state = running" in chk_out:
-            return {"ok": True, "warning": err or out}
         return {"ok": False, "error": err or out}
     return {"ok": True}
 
 
 def start_service() -> dict:
     uid = str(os.getuid())
-    code, out, err = run(["launchctl", "kickstart", "-k", f"gui/{uid}/{LABEL}"], timeout_sec=25)
+    code, out, err = run(["launchctl", "kickstart", "-k", f"gui/{uid}/{LABEL}"])
     return {"ok": code == 0, "error": err or out if code != 0 else None}
 
 
 def stop_service() -> dict:
     uid = str(os.getuid())
-    code, out, err = run(["launchctl", "bootout", f"gui/{uid}", LABEL], timeout_sec=20)
-    return {"ok": code == 0, "error": err or out if code != 0 else None}
+    code, out, err = run(["launchctl", "bootout", f"gui/{uid}/{LABEL}"])
+    if code != 0:
+        code, out, err = run(["launchctl", "bootout", f"gui/{uid}", LABEL])
+    if code == 0:
+        return {"ok": True, "error": None}
+
+    # launchctl can return errors even when the service is already gone.
+    st = status()
+    if not st.get("running"):
+        return {"ok": True, "error": None, "already_stopped": True}
+    return {"ok": False, "error": (err or out) if code != 0 else None}
 
 
 def status() -> dict:
     uid = str(os.getuid())
     p = plist_path()
-    code, out, err = run(["launchctl", "print", f"gui/{uid}/{LABEL}"], timeout_sec=20)
+    code, out, err = run(["launchctl", "print", f"gui/{uid}/{LABEL}"])
     running = code == 0 and "state = running" in out
     pid = None
     if running:
@@ -290,28 +274,31 @@ def status() -> dict:
 
 def uninstall() -> dict:
     _ = stop_service()
+    st = status()
+    if st.get("running") and st.get("pid"):
+        try:
+            os.kill(int(st["pid"]), 15)
+        except Exception:
+            pass
     p = plist_path()
     try:
         if p.exists():
             p.unlink()
-        return {"ok": True}
+        st2 = status()
+        return {"ok": True, "running": bool(st2.get("running"))}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
 
 def cmd_install(args: argparse.Namespace) -> int:
-    info("install start")
-    install_home = pathlib.Path(args.install_home).expanduser()
-    info("download bridge runtime")
-    ok, payload = ensure_bridge_script(args.bridge_script_url, install_home)
-    if not ok:
-        print(json.dumps({"ok": False, "step": "precheck", "error": payload}, ensure_ascii=False))
+    root = repo_root()
+    bridge_script = str(root / "scripts" / "dev" / "run_mock_openclaw_server.py")
+    if not pathlib.Path(bridge_script).exists():
+        print(json.dumps({"ok": False, "step": "precheck", "error": "bridge_script_not_found"}, ensure_ascii=False))
         return 1
-    bridge_script = payload
 
     base_python = args.python or default_python()
     venv_dir = pathlib.Path(args.venv_dir).expanduser()
-    info("prepare venv")
     ok, payload = ensure_venv_python(base_python, venv_dir)
     if not ok:
         print(json.dumps({"ok": False, "step": "venv", "error": payload}, ensure_ascii=False))
@@ -320,22 +307,19 @@ def cmd_install(args: argparse.Namespace) -> int:
 
     if not args.skip_deps:
         req_path = pathlib.Path(args.requirements).expanduser()
-        info("install dependencies")
         ok, payload = install_bridge_dependencies(py_bin, req_path)
         if not ok:
             print(json.dumps({"ok": False, "step": "deps_install", "error": payload}, ensure_ascii=False))
             return 1
-        info("verify dependencies")
         ok, payload = verify_bridge_runtime(py_bin)
         if not ok:
             print(json.dumps({"ok": False, "step": "deps_verify", "error": payload}, ensure_ascii=False))
             return 1
 
-    info("write launchd plist")
     plist = write_plist(
         py_bin,
         bridge_script,
-        str(install_home),
+        str(root),
         args.bridge_port,
         args.public_host,
         args.tts_engine,
@@ -344,7 +328,6 @@ def cmd_install(args: argparse.Namespace) -> int:
         args.installer_bootstrap_url,
     )
 
-    info("ensure OpenClaw agent")
     openclaw_bin = detect_openclaw_bin()
     openclaw_workspace = pathlib.Path(args.openclaw_workspace).expanduser()
     openclaw_workspace.mkdir(parents=True, exist_ok=True)
@@ -358,17 +341,14 @@ def cmd_install(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "step": "openclaw_agent_setup", **oc}, ensure_ascii=False))
         return 1
 
-    info("bootstrap launchd")
     boot = bootstrap(plist)
     if not boot.get("ok"):
         print(json.dumps({"ok": False, "step": "bootstrap", "error": boot.get("error")}, ensure_ascii=False))
         return 1
-    info("kickstart service")
     kick = start_service()
     if not kick.get("ok"):
         print(json.dumps({"ok": False, "step": "kickstart", "error": kick.get("error")}, ensure_ascii=False))
         return 1
-    info("install done")
     payload = {
         "ok": True,
         "label": LABEL,
@@ -383,9 +363,6 @@ def cmd_install(args: argparse.Namespace) -> int:
         "openclaw_thinking": args.openclaw_thinking,
         "openclaw_bin": openclaw_bin,
         "openclaw_agent_setup": oc,
-        "bridge_script_url": args.bridge_script_url,
-        "bridge_script_path": bridge_script,
-        "install_home": str(install_home),
     }
     print(json.dumps(payload, ensure_ascii=False))
     return 0
@@ -411,8 +388,6 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--python", default="")
     pi.add_argument("--venv-dir", default=str(DEFAULT_VENV_DIR))
     pi.add_argument("--requirements", default=str(DEFAULT_REQUIREMENTS))
-    pi.add_argument("--bridge-script-url", default=DEFAULT_BRIDGE_SCRIPT_URL)
-    pi.add_argument("--install-home", default=str(pathlib.Path.home() / ".local" / "share" / "sori-bridge" / "bridge"))
     pi.add_argument("--skip-deps", action="store_true")
 
     sub.add_parser("status")
