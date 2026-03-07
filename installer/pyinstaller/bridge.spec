@@ -1,8 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
 
-entry_script = "installer/run_mock_openclaw_server.py"
+spec_dir = Path(SPEC).resolve().parent
+entry_script = str((spec_dir.parent / "run_mock_openclaw_server.py").resolve())
+project_root = str(spec_dir.parent.parent.resolve())
 
 hiddenimports = collect_submodules("edge_tts")
 hiddenimports += collect_submodules("faster_whisper")
@@ -10,7 +13,7 @@ hiddenimports += collect_submodules("faster_whisper")
 
 a = Analysis(
     [entry_script],
-    pathex=["."],
+    pathex=[project_root],
     binaries=[],
     datas=[],
     hiddenimports=hiddenimports,
