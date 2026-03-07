@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${VERSION:-1.0.17}"
+VERSION="${VERSION:-1.0.18}"
 PAIRING_CODE="${PAIRING_CODE:-}"
 BRIDGE_PORT="${BRIDGE_PORT:-18890}"
 PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"

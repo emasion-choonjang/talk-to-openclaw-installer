@@ -1,9 +1,9 @@
 {
   "channel": "stable",
-  "version": "1.0.17",
-  "asset_url": "https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v1.0.17/sori-bridge-macos-arm64.tar.gz",
+  "version": "1.0.18",
+  "asset_url": "https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v1.0.18/sori-bridge-macos-arm64.tar.gz",
   "sha256": "REPLACE_WITH_RELEASE_SHA256",
-  "install_script_url": "https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v1.0.17/install.sh",
+  "install_script_url": "https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v1.0.18/install.sh",
   "min_app_version": "0.1.0",
   "blocked_versions": []
 }

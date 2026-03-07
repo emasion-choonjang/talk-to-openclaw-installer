@@ -2132,25 +2132,6 @@ function setStatus(type, text){{
   statusEl.className = 'status ' + type;
   statusEl.textContent = text;
 }}
-async function bestEffortCompleteDevicePairing(){{
-  try {{
-    const d = await fetch('/discover/device');
-    if (!d.ok) return false;
-    const dj = await d.json();
-    const base = (dj && dj.device_api_base_url) ? String(dj.device_api_base_url).replace(/\/$/, '') : '';
-    if (!base) return false;
-    const r = await fetch(base + '/device/pairing-complete', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ source: 'pairing_portal' }}),
-    }});
-    if (!r.ok) return false;
-    const j = await r.json();
-    return Boolean(j && j.ok);
-  }} catch (e) {{
-    return false;
-  }}
-}}
 async function submitPair(){{
   const code = codeEl.value.trim().toUpperCase();
   if (!/^[A-Z0-9]{{6}}$/.test(code)) {{
@@ -2171,21 +2152,18 @@ async function submitPair(){{
       submitBtn.disabled = false;
       return;
     }}
-    setStatus('ok', '연결 요청 완료. 기기 적용/검증 중...');
-    const paired = await bestEffortCompleteDevicePairing();
-    await new Promise((resolve) => setTimeout(resolve, paired ? 500 : 1200));
+    setStatus('ok', '연결 요청 완료. 앱으로 돌아가 연결을 마무리해 주세요.');
+    await new Promise((resolve) => setTimeout(resolve, 400));
     const s = await fetch('/pairing/session-status?pairingCode=' + encodeURIComponent(code));
     const sj = await s.json();
     const target = sj?.dialog?.target || sj?.dialog?.session_id || sj?.dialog?.agent;
     if (target) {{
-      setStatus('ok', paired
-        ? '연결 확정됨. 성공음이 재생되며, 앱이 곧 다음 단계로 이동합니다.'
-        : '연결 확정됨. 앱에서 연결 확인 시 자동으로 다음 단계로 이동합니다.');
+      setStatus('ok', 'OpenClaw 연결 요청이 확인됐어요. 이제 앱으로 돌아가 다음 단계로 진행해 주세요.');
     }} else {{
       setStatus('ok', '연결은 확정됐지만 OpenClaw 대상은 아직 없습니다. 앱 안내에 따라 target을 설정하세요.');
     }}
     submitBtn.classList.add('success');
-    submitBtn.textContent = '연결 확정됨';
+    submitBtn.textContent = '연결 요청 완료';
     submitBtn.disabled = true;
   }} catch (e) {{
     setStatus('err', '네트워크 오류로 연결에 실패했습니다.');
