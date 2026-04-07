@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${VERSION:-1.0.18}"
+VERSION="${VERSION:-}"
 PAIRING_CODE="${PAIRING_CODE:-}"
 BRIDGE_PORT="${BRIDGE_PORT:-18890}"
 PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
@@ -11,10 +11,29 @@ OPENCLAW_THINKING="${OPENCLAW_THINKING:-minimal}"
 ASSET_URL="${ASSET_URL:-}"
 ASSET_SHA256="${ASSET_SHA256:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-LEGACY_BOOTSTRAP_URL="${INSTALLER_BOOTSTRAP_URL:-https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v${VERSION}/sori_agent.py}"
 
 INSTALL_ROOT="${HOME}/Library/Application Support/SORI/bridge"
 RELEASES_DIR="${INSTALL_ROOT}/releases"
+
+infer_version_from_asset_url() {
+  local url="${1:-}"
+  if [[ "$url" =~ /download/v([0-9]+\.[0-9]+\.[0-9]+)/ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+if [[ -z "$VERSION" && -n "$ASSET_URL" ]]; then
+  VERSION="$(infer_version_from_asset_url "$ASSET_URL" || true)"
+fi
+
+if [[ -z "$VERSION" ]]; then
+  echo "[installer] ERROR: VERSION is required (or inferable from ASSET_URL)" >&2
+  exit 1
+fi
+
+LEGACY_BOOTSTRAP_URL="${INSTALLER_BOOTSTRAP_URL:-https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v${VERSION}/sori_agent.py}"
 RELEASE_DIR="${RELEASES_DIR}/${VERSION}"
 CURRENT_LINK="${INSTALL_ROOT}/current"
 PLIST_PATH="${HOME}/Library/LaunchAgents/ai.sori.bridge.plist"
