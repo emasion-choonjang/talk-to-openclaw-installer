@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 from urllib.parse import urlencode
@@ -21,6 +20,7 @@ import re
 import secrets
 import shutil
 import socket
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -29,6 +29,7 @@ import time
 import wave
 import queue
 import random
+import struct
 from pathlib import Path
 
 HOST = os.environ.get("OPENCLAW_HOST", "0.0.0.0")
@@ -87,13 +88,22 @@ STT_LANGUAGE = os.environ.get("STT_LANGUAGE", "ko").strip()
 STT_BEAM_SIZE = int(os.environ.get("STT_BEAM_SIZE", "2"))
 STT_VAD_FILTER = os.environ.get("STT_VAD_FILTER", "1").strip().lower() in ("1", "true", "yes", "on")
 STT_CONDITION_PREV_TEXT = os.environ.get("STT_CONDITION_PREV_TEXT", "0").strip().lower() in ("1", "true", "yes", "on")
-STT_INITIAL_PROMPT = os.environ.get("STT_INITIAL_PROMPT", "").strip()
+STT_INITIAL_PROMPT = os.environ.get(
+    "STT_INITIAL_PROMPT",
+    "다음은 한국어 일상 대화입니다. 제품 이름은 SORI, 호출어는 초아야 입니다. "
+    "초아야, 소리야, OpenClaw, 와이파이, 페어링 같은 단어를 자연스럽게 인식하세요.",
+).strip()
 STT_TIMEOUT_SEC = int(os.environ.get("STT_TIMEOUT_SEC", "35"))
+STT_LOW_LEVEL_PEAK_THRESHOLD = int(os.environ.get("STT_LOW_LEVEL_PEAK_THRESHOLD", "4200"))
+STT_LOW_LEVEL_BOOST_GAIN = int(os.environ.get("STT_LOW_LEVEL_BOOST_GAIN", "3"))
+STT_FALLBACK_NO_VAD = os.environ.get("STT_FALLBACK_NO_VAD", "1").strip().lower() in ("1", "true", "yes", "on")
+STT_FALLBACK_BOOSTED = os.environ.get("STT_FALLBACK_BOOSTED", "1").strip().lower() in ("1", "true", "yes", "on")
+STT_FALLBACK_BEAM_DELTA = int(os.environ.get("STT_FALLBACK_BEAM_DELTA", "1"))
 ASR_TURN_WAIT_SEC = int(os.environ.get("ASR_TURN_WAIT_SEC", "80"))
 ASR_ONLY_MODE = os.environ.get("ASR_ONLY_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
-INSTALLER_BOOTSTRAP_URL = os.environ.get(
-    "INSTALLER_BOOTSTRAP_URL",
-    "https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/download/v1.0.12/sori_agent.py",
+INSTALLER_MANIFEST_URL = os.environ.get(
+    "INSTALLER_MANIFEST_URL",
+    "https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/latest/download/stable.json",
 ).strip()
 CLOVA_API_BASE = os.environ.get("CLOVA_API_BASE", "https://naveropenapi.apigw.ntruss.com/tts-premium/v1").strip()
 CLOVA_API_KEY_ID = os.environ.get("CLOVA_API_KEY_ID", "").strip()
@@ -108,6 +118,11 @@ CLOVA_EMOTION = os.environ.get("CLOVA_EMOTION", "").strip()
 CLOVA_EMOTION_STRENGTH = os.environ.get("CLOVA_EMOTION_STRENGTH", "").strip()
 CLOVA_SAMPLE_RATE = os.environ.get("CLOVA_SAMPLE_RATE", "16000").strip()
 OPENCLAW_DIALOG_ROUTE_FILE = os.environ.get("OPENCLAW_DIALOG_ROUTE_FILE", "/tmp/openclaw_dialog_route.json").strip()
+BRIDGE_VOICE_CONFIG_FILE = os.environ.get("BRIDGE_VOICE_CONFIG_FILE", "/tmp/sori_bridge_voice_config.json").strip()
+DEFAULT_WAKE_WORD = os.environ.get("BRIDGE_WAKE_WORD", "초아야").strip() or "초아야"
+DEFAULT_WAKE_BACKEND = os.environ.get("BRIDGE_WAKE_BACKEND", "stub").strip() or "stub"
+DEFAULT_FOLLOWUP_WINDOW_MS = int(os.environ.get("BRIDGE_FOLLOWUP_WINDOW_MS", "7000"))
+DEFAULT_SPEAKER_LIVE_ENABLED = os.environ.get("BRIDGE_SPEAKER_LIVE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 
 QUEUE = deque()
 WAV_STORE = {}
@@ -145,6 +160,22 @@ JWT_AUDIENCE = os.environ.get("BRIDGE_JWT_AUDIENCE", "sori-mobile").strip()
 JWT_DEFAULT_TTL_SEC = int(os.environ.get("BRIDGE_JWT_TTL_SEC", "3600"))
 AUTH_REQUIRED_V2 = os.environ.get("BRIDGE_AUTH_REQUIRED_V2", "1").strip().lower() in ("1", "true", "yes", "on")
 INSTANCE_LOCK_HANDLE = None
+VOICE_CONFIG = {
+    "wake_word": DEFAULT_WAKE_WORD,
+    "wake_backend": DEFAULT_WAKE_BACKEND,
+    "followup_window_ms": DEFAULT_FOLLOWUP_WINDOW_MS,
+    "speaker_live_enabled": DEFAULT_SPEAKER_LIVE_ENABLED,
+    "ptt_mode_enabled": True,
+    "voice_config_version": 1,
+    "updated_at_ms": now_ms() if "now_ms" in globals() else int(time.time() * 1000),
+}
+
+ALLOWED_WAKE_BACKENDS = {"stub", "esp_sr"}
+SUPPORTED_WAKE_BACKENDS = sorted(ALLOWED_WAKE_BACKENDS)
+DEFAULT_WAKE_BACKEND_CAPABILITIES = {
+    "supported_wake_backends": SUPPORTED_WAKE_BACKENDS,
+    "default_wake_backend": "stub",
+}
 
 
 def save_dialog_route_state() -> None:
@@ -212,6 +243,68 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def normalize_voice_config(payload: dict, current: dict | None = None) -> dict:
+    base = dict(current or VOICE_CONFIG)
+    wake_word = str(payload.get("wake_word", base.get("wake_word", DEFAULT_WAKE_WORD))).strip() or DEFAULT_WAKE_WORD
+    wake_backend = str(payload.get("wake_backend", base.get("wake_backend", DEFAULT_WAKE_BACKEND))).strip() or DEFAULT_WAKE_BACKEND
+    if wake_backend not in ALLOWED_WAKE_BACKENDS:
+        raise ValueError("invalid_wake_backend")
+    followup_window_ms = int(payload.get("followup_window_ms", base.get("followup_window_ms", DEFAULT_FOLLOWUP_WINDOW_MS)))
+    followup_window_ms = max(2000, min(15000, followup_window_ms))
+    speaker_live_enabled = payload.get("speaker_live_enabled", base.get("speaker_live_enabled", DEFAULT_SPEAKER_LIVE_ENABLED))
+    if isinstance(speaker_live_enabled, str):
+        speaker_live_enabled = speaker_live_enabled.strip().lower() in ("1", "true", "yes", "on")
+    ptt_mode_enabled = payload.get("ptt_mode_enabled", base.get("ptt_mode_enabled", True))
+    if isinstance(ptt_mode_enabled, str):
+        ptt_mode_enabled = ptt_mode_enabled.strip().lower() in ("1", "true", "yes", "on")
+    return {
+        "wake_word": wake_word,
+        "wake_backend": wake_backend,
+        "followup_window_ms": followup_window_ms,
+        "speaker_live_enabled": bool(speaker_live_enabled),
+        "ptt_mode_enabled": bool(ptt_mode_enabled),
+        "voice_config_version": int(base.get("voice_config_version", 0)) + 1,
+        "updated_at_ms": now_ms(),
+    }
+
+
+def save_voice_config() -> None:
+    try:
+        tmp = f"{BRIDGE_VOICE_CONFIG_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(VOICE_CONFIG, f, ensure_ascii=False)
+        os.replace(tmp, BRIDGE_VOICE_CONFIG_FILE)
+    except Exception:
+        pass
+
+
+def load_voice_config() -> None:
+    global VOICE_CONFIG
+    try:
+        if not os.path.exists(BRIDGE_VOICE_CONFIG_FILE):
+            save_voice_config()
+            return
+        with open(BRIDGE_VOICE_CONFIG_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return
+        VOICE_CONFIG = {
+            "wake_word": str(payload.get("wake_word") or DEFAULT_WAKE_WORD).strip() or DEFAULT_WAKE_WORD,
+            "wake_backend": (
+                str(payload.get("wake_backend") or DEFAULT_WAKE_BACKEND).strip() or DEFAULT_WAKE_BACKEND
+            ),
+            "followup_window_ms": max(2000, min(15000, int(payload.get("followup_window_ms", DEFAULT_FOLLOWUP_WINDOW_MS)))),
+            "speaker_live_enabled": bool(payload.get("speaker_live_enabled", DEFAULT_SPEAKER_LIVE_ENABLED)),
+            "ptt_mode_enabled": bool(payload.get("ptt_mode_enabled", True)),
+            "voice_config_version": max(1, int(payload.get("voice_config_version", 1))),
+            "updated_at_ms": int(payload.get("updated_at_ms", now_ms())),
+        }
+        if VOICE_CONFIG["wake_backend"] not in ALLOWED_WAKE_BACKENDS:
+            VOICE_CONFIG["wake_backend"] = DEFAULT_WAKE_BACKEND
+    except Exception:
+        return
+
+
 def b64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
@@ -268,9 +361,14 @@ def issue_access_token(pairing_code: str, subject: str, ttl_sec: int) -> tuple[s
         "pc": pairing_code,
         "iat": now,
         "exp": now + ttl,
-        "scope": "chat events",
+        "scope": "chat events config:read config:write",
     }
     return jwt_sign_hs256(claims), ttl
+
+
+def claims_has_scope(claims: dict, scope: str) -> bool:
+    scopes = str(claims.get("scope") or "").split()
+    return scope in scopes
 
 
 def next_event_seq() -> int:
@@ -301,6 +399,13 @@ def push_turn_event(event: dict) -> None:
     with TURN_EVENTS_LOCK:
         TURN_EVENTS.append(payload)
     enqueue_bridge_log("turn_event", payload)
+
+
+def push_speaker_event(event: dict) -> None:
+    payload = enrich_event("turn", event)
+    with TURN_EVENTS_LOCK:
+        TURN_EVENTS.append(payload)
+    enqueue_bridge_log("speaker_event", payload)
 
 
 def collect_v2_events(since_seq: int = 0, limit: int = 200) -> list[dict]:
@@ -369,6 +474,39 @@ def maybe_read_device_config(ip: str, timeout_sec: float = 0.35) -> dict | None:
     except Exception:
         return None
     return None
+
+
+def notify_device_pairing_complete(
+    preferred_client_ip: str = "",
+    source: str = "pairing_portal",
+    attempts: int = 3,
+    per_try_timeout_sec: float = 1.4,
+) -> tuple[bool, str, str]:
+    ip, discover_source = discover_esp_device_ip(preferred_client_ip)
+    if not ip:
+        return False, "", f"discover_failed:{discover_source}"
+
+    url = f"http://{ip}:18991/device/pairing-complete"
+    body = json.dumps({"source": source}).encode("utf-8")
+    last_err = ""
+    for _ in range(max(1, attempts)):
+        try:
+            req = Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req, timeout=per_try_timeout_sec) as resp:
+                payload = json.loads(resp.read().decode("utf-8") or "{}")
+                if resp.status == 200 and isinstance(payload, dict) and payload.get("ok") is True:
+                    return True, ip, "ok"
+                last_err = f"http_{resp.status}"
+        except Exception as exc:
+            last_err = str(exc)
+        time.sleep(0.2)
+
+    return False, ip, last_err or "notify_failed"
 
 
 def discover_esp_device_ip(preferred_client_ip: str = "") -> tuple[str | None, str]:
@@ -467,6 +605,31 @@ def installer_status() -> dict:
         return payload
     except Exception as exc:
         return {"ok": False, "installed": False, "running": False, "error": str(exc)}
+
+
+def build_binary_install_command(*, pairing_code: str, bridge_host: str) -> tuple[str, str]:
+    manifest_url = INSTALLER_MANIFEST_URL.strip()
+    if not manifest_url:
+        manifest_url = "https://github.com/emasion-choonjang/talk-to-openclaw-installer/releases/latest/download/stable.json"
+
+    shell_parts = [
+        "set -e",
+        "TMP_DIR=$(mktemp -d)",
+        f"curl -fsSL {shlex.quote(manifest_url)} -o \"$TMP_DIR/stable.json\"",
+        'INSTALL_URL=$(plutil -extract install_script_url raw -o - "$TMP_DIR/stable.json")',
+        'ASSET_URL=$(plutil -extract asset_url raw -o - "$TMP_DIR/stable.json")',
+        'ASSET_SHA256=$(plutil -extract sha256 raw -o - "$TMP_DIR/stable.json")',
+        'curl -fsSL "$INSTALL_URL" -o "$TMP_DIR/install.sh"',
+        'chmod +x "$TMP_DIR/install.sh"',
+        (
+            f"PAIRING_CODE={shlex.quote(pairing_code)} BRIDGE_PORT={PORT} PUBLIC_HOST={shlex.quote(bridge_host)} "
+            f"TTS_ENGINE={shlex.quote(TTS_ENGINE)} OPENCLAW_AGENT={shlex.quote(OPENCLAW_DEFAULT_AGENT)} "
+            f"OPENCLAW_THINKING={shlex.quote(OPENCLAW_THINKING_LEVEL or 'minimal')} "
+            'ASSET_URL="$ASSET_URL" ASSET_SHA256="$ASSET_SHA256" bash "$TMP_DIR/install.sh"'
+        ),
+    ]
+    command = "bash -lc " + shlex.quote("; ".join(shell_parts))
+    return command, manifest_url
 
 
 def infer_openclaw_dialog_route() -> dict:
@@ -588,8 +751,6 @@ def generate_tone_wav(sample_rate: int = 16000, freq_hz: int = 660, duration_sec
     return bio.getvalue()
 
 
-
-
 def acquire_instance_lock(port: int):
     lock_path = f"/tmp/sori-bridge-{port}.lock"
     handle = open(lock_path, "a+", encoding="utf-8")
@@ -603,6 +764,7 @@ def acquire_instance_lock(port: int):
     handle.write(str(os.getpid()))
     handle.flush()
     return handle
+
 
 def synthesize_text_wav(text: str) -> bytes:
     text = sanitize_tts_text(text)
@@ -659,6 +821,19 @@ def sanitize_tts_text(text: str) -> str:
     if len(text) > 280:
         text = text[:280].rsplit(" ", 1)[0] + "."
     return text
+
+
+def payload_text_priority(item: dict) -> int:
+    role = str(item.get("role") or item.get("author") or "").strip().lower()
+    kind = str(item.get("type") or item.get("kind") or item.get("channel") or "").strip().lower()
+    name = str(item.get("name") or item.get("label") or "").strip().lower()
+    hay = " ".join(v for v in (role, kind, name) if v)
+
+    if any(token in hay for token in ("reason", "thinking", "thought", "tool", "debug", "trace", "analysis", "plan")):
+        return -10
+    if role in ("assistant", "model") or any(token in hay for token in ("assistant", "reply", "final", "answer", "message")):
+        return 10
+    return 0
 
 def synthesize_text_wav_with_clova(text: str) -> bytes | None:
     if not CLOVA_API_KEY_ID or not CLOVA_API_KEY:
@@ -865,6 +1040,42 @@ def canonicalize_wav_bytes(wav_bytes: bytes) -> bytes:
             sampwidth = src.getsampwidth()
             framerate = src.getframerate()
             frames = src.readframes(src.getnframes())
+
+        # Force bridge output to mono / 16-bit / target sample rate so ESP32
+        # playback stays in buffered mode more often (smaller WAV payload).
+        if sampwidth != 2:
+            return wav_bytes
+
+        if channels == 1:
+            samples = array("h")
+            samples.frombytes(frames)
+        else:
+            interleaved = array("h")
+            interleaved.frombytes(frames)
+            frame_count = len(interleaved) // channels
+            samples = array("h")
+            for i in range(frame_count):
+                base = i * channels
+                acc = 0
+                for ch in range(channels):
+                    acc += int(interleaved[base + ch])
+                samples.append(int(acc / channels))
+            channels = 1
+
+        if framerate != TTS_OUTPUT_SAMPLE_RATE and len(samples) > 1:
+            target_len = max(1, int(len(samples) * TTS_OUTPUT_SAMPLE_RATE / framerate))
+            resampled = array("h")
+            for i in range(target_len):
+                src_idx = int(i * framerate / TTS_OUTPUT_SAMPLE_RATE)
+                if src_idx >= len(samples):
+                    src_idx = len(samples) - 1
+                resampled.append(samples[src_idx])
+            samples = resampled
+            framerate = TTS_OUTPUT_SAMPLE_RATE
+
+        frames = samples.tobytes()
+        sampwidth = 2
+
         out = BytesIO()
         with wave.open(out, "wb") as dst:
             dst.setnchannels(channels)
@@ -1008,16 +1219,15 @@ def run_openclaw_agent(
     cmd = [OPENCLAW_BIN, "agent"]
     if target:
         cmd.extend(["--to", target])
-    elif session_id:
-        cmd.extend(["--session-id", session_id])
     elif agent:
         cmd.extend(["--agent", agent])
+    elif session_id:
+        cmd.extend(["--session-id", session_id])
     # No explicit target: fall back to local/default OpenClaw context.
     outbound_message = message
     if OPENCLAW_NO_EMOJI:
         outbound_message = (
-            "이모지는 절대 사용하지 말고, 한국어 평문으로 짧고 명확하게 답해줘. "
-            "한 문장으로, 최대 22자 내외로 답해줘. "
+            "이모지는 절대 사용하지 말고, 한국어 평문으로 자연스럽고 명확하게 답해줘. "
             + message
         )
     if OPENCLAW_THINKING_LEVEL in ("off", "minimal", "low", "medium", "high"):
@@ -1057,40 +1267,19 @@ def run_openclaw_agent(
     else:
         items = payload.get("payloads", [])
     text = ""
-    for item in (items or []):
+    ranked_items = sorted(
+        [item for item in (items or []) if isinstance(item, dict)],
+        key=payload_text_priority,
+        reverse=True,
+    )
+    for item in ranked_items:
         candidate = sanitize_tts_text(item.get("text") or "")
-        if candidate:
+        if candidate and payload_text_priority(item) >= 0:
             text = candidate
             break
     if text:
         return text
-
-    # JSON shape fallback: pull text-like fields recursively.
-    def _collect_strings(obj: object, out: list[str]) -> None:
-        if isinstance(obj, str):
-            s = sanitize_tts_text(obj)
-            if s:
-                out.append(s)
-            return
-        if isinstance(obj, list):
-            for v in obj:
-                _collect_strings(v, out)
-            return
-        if isinstance(obj, dict):
-            # Prioritize common text keys first.
-            for k in ("text", "message", "content", "reply"):
-                if k in obj:
-                    _collect_strings(obj.get(k), out)
-            for _k, v in obj.items():
-                _collect_strings(v, out)
-
-    candidates: list[str] = []
-    _collect_strings(payload, candidates)
-    for c in candidates:
-        if len(c) >= 2:
-            return c
-
-    raise RuntimeError(f"No OpenClaw payload text found: {cp.stdout[:240]}")
+    raise RuntimeError(f"No assistant reply payload text found: {cp.stdout[:240]}")
 
 
 def transcribe_wav_bytes(wav_bytes: bytes) -> str:
@@ -1129,8 +1318,8 @@ def transcribe_wav_bytes(wav_bytes: bytes) -> str:
             samples.frombytes(pcm)
             peak = max((abs(int(s)) for s in samples), default=0)
             # Low input level: create boosted fallback wav for 3rd attempt.
-            if peak > 0 and peak < 4200:
-                gain = 3
+            if STT_FALLBACK_BOOSTED and peak > 0 and peak < STT_LOW_LEVEL_PEAK_THRESHOLD:
+                gain = max(1, STT_LOW_LEVEL_BOOST_GAIN)
                 boosted = array("h")
                 for s in samples:
                     v = int(s) * gain
@@ -1167,23 +1356,25 @@ def transcribe_wav_bytes(wav_bytes: bytes) -> str:
                 "beam_size": max(1, STT_BEAM_SIZE),
                 "initial_prompt": STT_INITIAL_PROMPT if STT_INITIAL_PROMPT else None,
             },
-            # Fallback for short/weak speech: disable VAD and widen search once.
-            {
-                "name": "fallback_no_vad",
-                "path": tmp_path,
-                "vad_filter": False,
-                "beam_size": max(2, STT_BEAM_SIZE + 1),
-                "initial_prompt": None,
-            },
         ]
-        if boosted_tmp_path is not None:
+        if STT_FALLBACK_NO_VAD:
+            attempts.append(
+                {
+                    "name": "fallback_no_vad",
+                    "path": tmp_path,
+                    "vad_filter": False,
+                    "beam_size": max(2, STT_BEAM_SIZE + STT_FALLBACK_BEAM_DELTA),
+                    "initial_prompt": STT_INITIAL_PROMPT if STT_INITIAL_PROMPT else None,
+                }
+            )
+        if STT_FALLBACK_BOOSTED and boosted_tmp_path is not None:
             attempts.append(
                 {
                     "name": "fallback_boosted_no_vad",
                     "path": boosted_tmp_path,
                     "vad_filter": False,
-                    "beam_size": max(2, STT_BEAM_SIZE + 1),
-                    "initial_prompt": None,
+                    "beam_size": max(2, STT_BEAM_SIZE + STT_FALLBACK_BEAM_DELTA),
+                    "initial_prompt": STT_INITIAL_PROMPT if STT_INITIAL_PROMPT else None,
                 }
             )
         started_at = time.time()
@@ -1615,6 +1806,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(401, {"error": "unauthorized", "detail": str(exc)})
             return None
 
+    def _require_v2_scope(self, scope: str) -> dict | None:
+        claims = self._require_v2_auth()
+        if claims is None:
+            return None
+        if scope and not claims_has_scope(claims, scope):
+            self._send_json(403, {"error": "forbidden", "detail": f"missing_scope:{scope}"})
+            return None
+        return claims
+
     def do_GET(self):
         global CURRENT_DIALOG_TARGET, CURRENT_DIALOG_SESSION_ID, CURRENT_DIALOG_AGENT, LAST_TTS_PULL_AT_MS, LAST_TTS_PULL_IP, LAST_TTS_PULL_METRICS
         parsed = urlparse(self.path)
@@ -1790,6 +1990,21 @@ class Handler(BaseHTTPRequestHandler):
                 return
             return
 
+        if path == "/v2/config/voice":
+            claims = self._require_v2_scope("config:read")
+            if claims is None:
+                return
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "voice": dict(VOICE_CONFIG),
+                    **DEFAULT_WAKE_BACKEND_CAPABILITIES,
+                    "source": "bridge",
+                },
+            )
+            return
+
         if path == "/asr/dashboard":
             html = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -1957,29 +2172,16 @@ tick();
                 self._send_json(400, {"error": "bad_request", "detail": "pairingCode required"})
                 return
             bridge_host = request_bridge_host_port(self)[0]
-            bridge_base = request_bridge_endpoint(self)
-            installer_url = INSTALLER_BOOTSTRAP_URL or f"{bridge_base}/installer/agent.py"
-            model_arg = f" --openclaw-model {OPENCLAW_BOOTSTRAP_MODEL}" if OPENCLAW_BOOTSTRAP_MODEL else ""
-            cmd = (
-                "bash -lc '"
-                "set -e; "
-                "TMP_DIR=$(mktemp -d); "
-                f"curl -fsSL {installer_url} -o \"$TMP_DIR/sori_agent.py\"; "
-                f"python3 \"$TMP_DIR/sori_agent.py\" install --pairing-code {code} --bridge-port {PORT} --public-host {bridge_host} --tts-engine {TTS_ENGINE} --openclaw-agent {OPENCLAW_DEFAULT_AGENT}{model_arg} --openclaw-thinking {OPENCLAW_THINKING_LEVEL or 'minimal'} --installer-bootstrap-url {installer_url}"
-                "'"
-            )
+            cmd, manifest_url = build_binary_install_command(pairing_code=code, bridge_host=bridge_host)
             notes = "Run this on the Mac where OpenClaw is installed."
-            if INSTALLER_BOOTSTRAP_URL:
-                notes += " Installer is fetched from INSTALLER_BOOTSTRAP_URL."
-            else:
-                notes += " Installer is fetched from bridge URL (development fallback)."
+            notes += " Installer resolves the approved bridge version from stable.json."
             self._send_json(
                 200,
                 {
                     "ok": True,
                     "pairingCode": code,
                     "command": cmd,
-                    "installer_url": installer_url,
+                    "installer_manifest_url": manifest_url,
                     "notes": notes,
                 },
             )
@@ -2066,13 +2268,18 @@ tick();
                 session["updated_at_ms"] = now_ms()
             if target:
                 CURRENT_DIALOG_TARGET = target
-            if session_id:
-                CURRENT_DIALOG_SESSION_ID = session_id
             if agent:
                 CURRENT_DIALOG_AGENT = agent
+                CURRENT_DIALOG_SESSION_ID = ""
+            elif session_id:
+                CURRENT_DIALOG_SESSION_ID = session_id
             route_ok, route_source = ensure_dialog_route()
             save_dialog_route_state()
             dialog_ready = bool(CURRENT_DIALOG_TARGET or CURRENT_DIALOG_SESSION_ID or CURRENT_DIALOG_AGENT)
+            device_notified, device_ip, device_notify_status = notify_device_pairing_complete(
+                self.client_address[0] if self.client_address else "",
+                source="pairing_portal",
+            )
             self._send_json(
                 200,
                 {
@@ -2082,6 +2289,9 @@ tick();
                     "dialog_ready": dialog_ready,
                     "warning": None if dialog_ready else "OpenClaw target is not configured yet. Set to/session_id/agent before dialog turn.",
                     "route_source": route_source if route_ok else None,
+                    "device_pairing_notified": device_notified,
+                    "device_api_ip": device_ip or None,
+                    "device_notify_status": device_notify_status,
                     "dialog": {
                         "target": CURRENT_DIALOG_TARGET or None,
                         "session_id": CURRENT_DIALOG_SESSION_ID or None,
@@ -2243,6 +2453,48 @@ async function submitPair(){{
                 },
             )
             return
+
+        self._send_json(404, {"error": "not_found", "path": self.path})
+
+    def do_PATCH(self):
+        parsed = urlparse(self.path)
+        purge_expired_pairing_state()
+
+        if parsed.path == "/v2/config/voice":
+            claims = self._require_v2_scope("config:write")
+            if claims is None:
+                return
+            try:
+                payload = self._read_json()
+                if not bool(payload.get("confirm")):
+                    self._send_json(400, {"error": "bad_request", "detail": "confirm required"})
+                    return
+                global VOICE_CONFIG
+                VOICE_CONFIG = normalize_voice_config(payload, VOICE_CONFIG)
+                save_voice_config()
+                push_turn_event(
+                    {
+                        "status": "voice_config_updated",
+                        "text": f"wake_word={VOICE_CONFIG['wake_word']}",
+                        "meta": {
+                            "voice_config_version": VOICE_CONFIG["voice_config_version"],
+                            "updated_by": str(claims.get("sub") or ""),
+                        },
+                    }
+                )
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "voice": dict(VOICE_CONFIG),
+                        **DEFAULT_WAKE_BACKEND_CAPABILITIES,
+                        "source": "bridge",
+                    },
+                )
+                return
+            except Exception as exc:
+                self._send_json(400, {"error": "bad_request", "detail": str(exc)})
+                return
 
         self._send_json(404, {"error": "not_found", "path": self.path})
 
@@ -2414,6 +2666,32 @@ async function submitPair(){{
                         "wav_store_size": len(WAV_STORE),
                     },
                 )
+                return
+            except Exception as exc:
+                self._send_json(400, {"error": "bad_request", "detail": str(exc)})
+                return
+
+        if parsed.path == "/speaker/event":
+            try:
+                payload = self._read_json()
+                event_name = str(payload.get("event", "")).strip()
+                if not event_name:
+                    self._send_json(400, {"error": "bad_request", "detail": "event required"})
+                    return
+                push_speaker_event(
+                    {
+                        "ts_ms": int(payload.get("ts_ms", now_ms())),
+                        "event": event_name,
+                        "status": "ok",
+                        "text": str(payload.get("reason", "")).strip(),
+                        "meta": {
+                            "phase": str(payload.get("phase", "")).strip(),
+                            "voice_config_version": payload.get("voice_config_version"),
+                            "client_ip": self.client_address[0],
+                        },
+                    }
+                )
+                self._send_json(200, {"ok": True})
                 return
             except Exception as exc:
                 self._send_json(400, {"error": "bad_request", "detail": str(exc)})
@@ -2603,11 +2881,19 @@ if __name__ == "__main__":
         print(f"[bridge] {exc}", flush=True)
         raise SystemExit(0)
     load_dialog_route_state()
+    load_voice_config()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     threading.Thread(target=bridge_log_writer, daemon=True, name="bridge-log-writer").start()
     threading.Thread(target=turn_job_worker, daemon=True, name="turn-job-worker").start()
     print(
         f"[tts] config engine={TTS_ENGINE} voice={VOICE} xtts_speaker={XTTS_SPEAKER_WAV or '-'}",
+        flush=True,
+    )
+    print(
+        "[stt] config "
+        f"engine={STT_ENGINE} model={STT_MODEL} beam={STT_BEAM_SIZE} vad={int(STT_VAD_FILTER)} "
+        f"fallback_no_vad={int(STT_FALLBACK_NO_VAD)} fallback_boosted={int(STT_FALLBACK_BOOSTED)} "
+        f"boost_peak<{STT_LOW_LEVEL_PEAK_THRESHOLD} gain={STT_LOW_LEVEL_BOOST_GAIN} timeout={STT_TIMEOUT_SEC}s",
         flush=True,
     )
     print(f"OpenClaw mock server listening on http://{HOST}:{PORT} public_host={PUBLIC_HOST}")
